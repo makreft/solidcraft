@@ -4,7 +4,7 @@
 use serde_json::{Value, json};
 use solidcraft_cam::{Cut, Feeds, Heights, Operation, Post, Program, Side, Tool, ToolKind, contour, emit, pocket, readback};
 use solidcraft_doc::cam::{
-    CamOperation, CamSettings, CamSetup, MAX_OPS, MAX_SETUPS, MAX_TOOLS, PolygonRegion, StockBox, default_contour_params, default_cut,
+    CamOperation, CamSettings, CamSetup, MAX_OPS, MAX_POSTS, MAX_SETUPS, MAX_TOOLS, PolygonRegion, StockBox, default_contour_params, default_cut,
     default_pocket_params,
 };
 
@@ -37,6 +37,11 @@ pub static COMMANDS: &[CommandSpec] = &[
         "setup; post?: rs274 | name of a saved post (default rs274); program?: name (default the setup's); \
          verify?: bool (default true: read the G-code back and check it against the toolpaths) → \
          {gcode, extension, post, operations, readback?}",
+    ),
+    CommandSpec::new("cam.post.define", "Define Post", post_define_cmd).icon("post").params(
+        "post: {name, extension, units, decimals, feed_decimals, comments, header, tool_change, tool_change_first, spindle_on, \
+         spindle_off, coolant_on, coolant_off, footer, arcs, arc_tolerance, …} (a post as data, saved with the design and \
+         replacing one of the same name) | name + delete: true",
     ),
     CommandSpec::new("cam.list", "List CAM", list_cmd).icon("tool").noundo().params("→ tools, setups (with operations) and saved posts"),
 ];
@@ -359,6 +364,41 @@ fn post_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
+fn post_define_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.post.define";
+    if bool_(p, "delete").unwrap_or(false) {
+        let name = str_(p, "name").map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad(cmd, "`name` is required"))?.to_string();
+        let doc = s.doc_mut();
+        let before = doc.cam.posts.len();
+        doc.cam.posts.retain(|q| q.name != name);
+        if doc.cam.posts.len() == before {
+            return Err(bad(cmd, format!("no saved post `{name}`")));
+        }
+        return Ok(json!({"deleted": name}));
+    }
+    let value = p.get("post").filter(|v| v.is_object()).ok_or_else(|| bad(cmd, "`post` is required: the post as data"))?;
+    let mut post: Post = serde_json::from_value(value.clone()).map_err(|e| bad(cmd, format!("`post`: {e}")))?;
+    post.name = post.name.trim().to_string();
+    if post.name.is_empty() || post.name.len() > 128 {
+        return Err(bad(cmd, "a post name must be 1 to 128 characters"));
+    }
+    // A saved post is looked up before the built-in ones and would hide one of the same name.
+    if Post::builtin(&post.name).is_some() {
+        return Err(bad(cmd, format!("`{}` is a built-in post: give yours another name", post.name)));
+    }
+    post.validate().map_err(|e| bad(cmd, e.to_string()))?;
+    let doc = s.doc_mut();
+    let posts = &mut doc.cam.posts;
+    if posts.len() >= MAX_POSTS && !posts.iter().any(|q| q.name == post.name) {
+        return Err(bad(cmd, format!("a design saves at most {MAX_POSTS} posts")));
+    }
+    match posts.iter_mut().find(|q| q.name == post.name) {
+        Some(slot) => *slot = post.clone(),
+        None => posts.push(post.clone()),
+    }
+    Ok(json!({"post": post.name}))
+}
+
 fn resolve_post(cam: &CamSettings, name: &str) -> std::result::Result<Post, String> {
     if let Some(p) = cam.post(name) {
         return Ok(p.clone());
@@ -484,5 +524,50 @@ mod tests {
         run(&mut s, "cam.setup", json!({"name": "S", "delete": true}));
         run(&mut s, "cam.tool", json!({"number": 2, "delete": true}));
         assert!(s.doc.cam.is_empty());
+    }
+
+    #[test]
+    fn a_post_saved_with_the_design_writes_its_programs() {
+        let mut s = Session::default();
+        let ring =
+            |rpm: u32| json!({"setup": "Top", "name": "Ring", "tool": 1, "outer": [[0,0],[40,0],[40,30],[0,30]], "bottom": -2, "spindle_rpm": rpm});
+        run(&mut s, "cam.tool", json!({"number": 1, "diameter": 6, "flute_length": 20}));
+        run(&mut s, "cam.setup", json!({"name": "Top"}));
+        run(&mut s, "cam.contour", ring(2000));
+        let mut post = serde_json::to_value(Post::rs274()).unwrap();
+        post["name"] = json!("Half turns");
+        post["header"] = json!(["%", "G17 {units} G90 {work_offset}"]);
+        post["max_arc_sweep"] = json!(180);
+        post["spindle_range"] = json!({"min": 3000, "max": 24000});
+        post["one_tool"] = json!(true);
+        run(&mut s, "cam.post.define", json!({"post": post}));
+        // 2000 rev/min is below what the machine runs.
+        let refused = s.execute("cam.post", &json!({"setup": "Top", "post": "Half turns"})).unwrap_err().to_string();
+        assert!(refused.contains("outside the spindle range"), "{refused}");
+        run(&mut s, "cam.delete_op", json!({"setup": "Top", "name": "Ring"}));
+        run(&mut s, "cam.contour", ring(12000));
+        let posted = run(&mut s, "cam.post", json!({"setup": "Top", "post": "Half turns"}));
+        assert!(posted["gcode"].as_str().unwrap().lines().nth(1) == Some("%"), "{}", posted["gcode"]);
+        assert!(posted["readback"]["within"].as_bool().unwrap());
+
+        // Saved with the design, replaced by name, and removed again.
+        let cold = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        assert_eq!(cold.doc.cam.posts.len(), 1);
+        post["decimals"] = json!(3);
+        run(&mut s, "cam.post.define", json!({"post": post}));
+        assert_eq!(s.doc.cam.posts.len(), 1);
+        assert_eq!(s.doc.cam.posts[0].decimals, 3);
+        run(&mut s, "cam.post.define", json!({"name": "Half turns", "delete": true}));
+        assert!(s.doc.cam.posts.is_empty());
+
+        // Bad posts and names are refused.
+        let mut builtin = post.clone();
+        builtin["name"] = json!("LinuxCNC");
+        assert!(s.execute("cam.post.define", &json!({"post": builtin})).is_err());
+        let mut broken = post.clone();
+        broken["max_arc_sweep"] = json!(720);
+        assert!(s.execute("cam.post.define", &json!({"post": broken})).is_err());
+        assert!(s.execute("cam.post.define", &json!({"post": "rs274"})).is_err());
+        assert!(s.execute("cam.post.define", &json!({"name": "missing", "delete": true})).is_err());
     }
 }

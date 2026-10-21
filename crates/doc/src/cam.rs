@@ -11,6 +11,8 @@ use crate::{DocError, Result};
 pub const MAX_TOOLS: usize = 256;
 /// Most setups in one design.
 pub const MAX_SETUPS: usize = 64;
+/// Most posts saved with one design.
+pub const MAX_POSTS: usize = 32;
 /// Most operations in one setup.
 pub const MAX_OPS: usize = 256;
 /// Most vertices on one polygon loop.
