@@ -241,10 +241,10 @@ impl CamOperation {
         if !(cut.stepdown > 0.0) || !cut.stepdown.is_finite() {
             return Err(DocError::Invalid("stepdown must be above 0".into()));
         }
-        if let Some(rpm) = spindle {
-            if !(rpm > 0.0) || !rpm.is_finite() || rpm > 1.0e6 {
-                return Err(DocError::Invalid("spindle_rpm must be above 0".into()));
-            }
+        if let Some(rpm) = spindle
+            && (!(rpm > 0.0) || !rpm.is_finite() || rpm > 1.0e6)
+        {
+            return Err(DocError::Invalid("spindle_rpm must be above 0".into()));
         }
         Ok(())
     }
