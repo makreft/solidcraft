@@ -582,6 +582,14 @@ fn programs_the_machine_cannot_run_are_refused() {
     // The same tool twice is still one tool.
     two.operations[1].tool.number = 3;
     assert!(emit(&two, &post).is_ok());
+
+    // The holes are 20.5 mm apart and the tool goes from 10 above the top to 10 below it.
+    let travel = |x, y, z| Post { travel: Some(Travel { x, y, z }), ..Post::rs274() };
+    assert!(emit(&drill_program(), &travel(20.5, 0.1, 20.0)).is_ok(), "exactly the travel fits");
+    let refused = emit(&drill_program(), &travel(20.0, 600.0, 200.0)).unwrap_err().to_string();
+    assert!(refused.contains("20.5 mm in X") && refused.contains("20 mm"), "{refused}");
+    let refused = emit(&drill_program(), &travel(900.0, 600.0, 15.0)).unwrap_err().to_string();
+    assert!(refused.contains("20 mm in Z"), "{refused}");
 }
 
 #[test]
@@ -710,9 +718,11 @@ fn posts_are_data_and_bad_ones_are_refused() {
     assert!(broken(|p| p.max_arc_sweep = Some(f64::NAN)));
     assert!(broken(|p| p.spindle_range = Some(SpindleRange { min: 24000.0, max: 3000.0 })));
     assert!(broken(|p| p.spindle_range = Some(SpindleRange { min: f64::NAN, max: 3000.0 })));
+    assert!(broken(|p| p.travel = Some(Travel { x: 900.0, y: 0.0, z: 200.0 })));
+    assert!(broken(|p| p.travel = Some(Travel { x: f64::INFINITY, y: 600.0, z: 200.0 })));
     // A post saved before these switches existed reads with what it meant.
     let mut old = serde_json::to_value(Post::rs274()).unwrap();
-    for k in ["helical_arcs", "trailing_decimal", "two_digit_codes", "dwell", "max_arc_sweep", "spindle_range", "one_tool"] {
+    for k in ["helical_arcs", "trailing_decimal", "two_digit_codes", "dwell", "max_arc_sweep", "spindle_range", "one_tool", "travel"] {
         old.as_object_mut().unwrap().remove(k);
     }
     assert_eq!(serde_json::from_value::<Post>(old).unwrap(), Post::rs274());

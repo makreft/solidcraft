@@ -28,7 +28,7 @@ pub use gcode::{Operation, Program, emit, parse, work_offset_code};
 pub use offset::offset_regions;
 pub use ops::{ContourParams, Cut, Feeds, Heights, PocketParams, Side, contour, pocket};
 pub use path::{Move, PathStats, Toolpath, arc_sweep};
-pub use post::{CommentStyle, LineNumbers, Post, SpindleRange, Units};
+pub use post::{CommentStyle, LineNumbers, Post, SpindleRange, Travel, Units};
 pub use readback::{Readback, allowed_deviation, readback};
 pub use tool::{Tool, ToolKind};
 

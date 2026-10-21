@@ -247,6 +247,24 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
             ));
         }
     }
+    if let Some(travel) = post.travel {
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for (p, _) in program.operations.iter().flat_map(|op| op.path.points(0.01)) {
+            for (i, v) in [p.x, p.y, p.z].into_iter().enumerate() {
+                (lo[i], hi[i]) = (lo[i].min(v), hi[i].max(v));
+            }
+        }
+        for (i, (axis, reach)) in [("X", travel.x), ("Y", travel.y), ("Z", travel.z)].into_iter().enumerate() {
+            if hi[i] - lo[i] > reach + 1e-6 {
+                return invalid(format!(
+                    "the program spans {} mm in {axis}, more than the {} mm the machine of post `{}` travels",
+                    number(hi[i] - lo[i], 1),
+                    number(reach, 1),
+                    plain(&post.name)
+                ));
+            }
+        }
+    }
     let mut w = Writer { post, out: String::new(), line: post.line_numbers.map(|n| n.start), x: None, y: None, z: None, pos: None, feed: None };
     let offset = program.work_offset.unwrap_or(1);
     // A post that leaves the offset to the operator can only mean the first one.

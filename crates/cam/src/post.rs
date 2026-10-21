@@ -109,6 +109,18 @@ pub struct Post {
     /// program: one with more tools is refused rather than written.
     #[serde(default)]
     pub one_tool: bool,
+    /// How far the machine travels on each axis (mm): a program that spans more on any axis is
+    /// refused, since no work zero brings all of it within reach.
+    #[serde(default)]
+    pub travel: Option<Travel>,
+}
+
+/// The travel of a machine's axes (mm).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Travel {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
 }
 
 /// The spindle speeds a machine runs (rev/min).
@@ -165,6 +177,7 @@ impl Post {
             max_arc_sweep: None,
             spindle_range: None,
             one_tool: false,
+            travel: None,
         }
     }
 
@@ -198,6 +211,9 @@ impl Post {
         }
         if self.spindle_range.is_some_and(|r| !(r.min >= 0.0 && r.min <= r.max && r.max <= 1.0e6)) {
             return invalid("the post's spindle range must run from its lowest to its highest speed, 0 to 1000000 rev/min");
+        }
+        if self.travel.is_some_and(|t| [t.x, t.y, t.z].iter().any(|v| !(*v > 0.0 && *v <= 1.0e5))) {
+            return invalid("the post's travel must be above 0 and at most 100 m on every axis");
         }
         if self.extension.is_empty() || self.extension.len() > 8 || !self.extension.chars().all(|c| c.is_ascii_alphanumeric()) {
             return invalid("the post's file extension must be 1 to 8 letters or digits");
