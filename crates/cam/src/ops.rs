@@ -287,7 +287,7 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
     check_ramp(params.ramp_angle)?;
     let shape = Shape::from_regions(regions, params.tolerance)?;
     let away = tool.radius() + params.stock_to_leave;
-    let loops = match params.side {
+    let mut loops = match params.side {
         Side::Outside => shape.offset(-away)?,
         Side::Inside => shape.offset(away)?,
         Side::On => shape.loops().to_vec(),
@@ -295,6 +295,10 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
     if loops.is_empty() {
         return invalid("the tool does not fit the profile");
     }
+    // A cut through the stock frees what a loop encloses: smaller loops first, so every hole is
+    // cut while the part round it is still held by its uncut outline.
+    let area = |lp: &[Piece]| lp.iter().map(Piece::area_term).sum::<f64>().abs();
+    loops.sort_by(|a, b| area(a).total_cmp(&area(b)));
     // Loops come with the regions on their left. Around a part that puts the wall on the left
     // (conventional), inside an opening on the right (climb).
     let natural_is_climb = params.side != Side::Outside;

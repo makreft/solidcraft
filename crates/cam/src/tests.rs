@@ -225,6 +225,21 @@ fn contour_runs_round_the_part_with_the_wall_on_the_chosen_side() {
     assert!(turns(&inner) > 0.0);
 }
 
+#[test]
+fn holes_are_cut_before_the_outline_that_holds_the_part() {
+    // The hole is given first and last: either way the tool goes round it before the outline.
+    let hole = rect(10.0, 10.0, 20.0, 20.0).outer.reversed();
+    let params = ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 };
+    for holes in [vec![hole.clone()], vec![hole.clone(), Loop2::circle(v(50.0, 15.0), 5.0)]] {
+        let plate = [Region2 { outer: rect(0.0, 0.0, 60.0, 30.0).outer, holes }];
+        let path = contour(&plate, &tool(6.0), &params, &cut(0.0, -6.0, 6.0)).unwrap();
+        let cuts = cutting_points(&path, -5.9);
+        let outline = cuts.iter().position(|p| p.x < 0.0 || p.y < 0.0).unwrap();
+        assert!(cuts[..outline].iter().any(|p| p.x > 10.0 && p.x < 20.0 && p.y > 10.0 && p.y < 20.0), "the hole comes first");
+        assert!(cuts[outline..].iter().all(|p| p.x < 0.0 || p.y < 0.0 || p.x > 60.0 || p.y > 30.0), "nothing after the outline");
+    }
+}
+
 /// The steepest descent of a cutting move (radians), and whether any goes straight down below `top`.
 fn steepest(path: &Toolpath, top: f64) -> (f64, bool) {
     let pts = path.points(0.002);
