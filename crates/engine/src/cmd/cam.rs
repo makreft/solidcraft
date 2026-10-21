@@ -3,14 +3,19 @@
 
 use serde_json::{Value, json};
 use solidcraft_cam::{Cut, Feeds, Heights, Operation, Post, Program, Side, Tool, ToolKind, contour, emit, pocket, readback};
+use solidcraft_doc::ProfileSel;
 use solidcraft_doc::cam::{
-    CamOperation, CamSettings, CamSetup, MAX_OPS, MAX_POSTS, MAX_SETUPS, MAX_TOOLS, PolygonRegion, StockBox, default_contour_params, default_cut,
-    default_pocket_params,
+    CamOperation, CamSettings, CamSetup, MAX_LOOP_POINTS, MAX_OPS, MAX_POSTS, MAX_SETUPS, MAX_TOOLS, PolygonRegion, StockBox, default_contour_params,
+    default_cut, default_pocket_params,
 };
+use solidcraft_geom::{Region2, Vec2};
 
 use super::CommandSpec;
-use crate::params::{bad, bool_, num, str_, vec2_list};
-use crate::{Result, Session};
+use crate::params::{bad, bool_, num, str_, vec2, vec2_list};
+use crate::{EngineError, Result, Session};
+
+/// Chord error of sketch profiles turned into an operation's polygons (mm).
+const PROFILE_TOLERANCE: f64 = 0.005;
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool", "CAM Tool", tool_cmd).at("MANUFACTURE", "SETUP").icon("tool").params(
@@ -22,21 +27,28 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("setup")
         .params("name; work_offset?: 1…6 (G54…G59, default 1); stock?: {min:[x,y,z], max:[x,y,z]}; delete?: bool"),
     CommandSpec::new("cam.contour", "2D Contour", contour_cmd).at("MANUFACTURE", "MILLING").icon("contour").params(
-        "setup; name; tool (number); outer: [[x,y],…] (or regions: [{outer, holes?}]); holes?: [[[x,y],…]]; \
-         side?: outside|inside|on (default outside); climb?: bool (default true); stock_to_leave?; tolerance?; \
-         ramp_angle?: deg (default 0); clearance?; retract?; top?; bottom (required unless cut given); stepdown?; \
-         feed?; plunge_feed?; spindle_rpm?; coolant?; cut?: {heights, feeds, stepdown}",
+        "setup; name; tool (number); outer: [[x,y],…] (or regions: [{outer, holes?}], or sketch: id|name with profiles?: \
+         all|[index]|[{point:[x,y]}] (default: every profile that is not the inside of another's hole; copied as polygons \
+         within 0.005 mm), rotate?: 0|90|180|270 (deg, about the sketch origin), at?: [x,y] (where the lower left corner \
+         of the profiles' bounds goes; default where they are)); holes?: [[[x,y],…]]; side?: outside|inside|on (default \
+         outside: a part with holes is cut free, every hole before the outline round it); climb?: bool (default true); \
+         stock_to_leave?; tolerance?; ramp_angle?: deg (default 0); clearance?; retract?; top?; bottom (required unless \
+         cut given); stepdown?; feed?; plunge_feed?; spindle_rpm? (feeds and speed default to the tool's; refused when \
+         neither has them); coolant?; cut?: {heights, feeds, stepdown} → {setup, operation, bounds, too_small?: \
+         openings the tool does not fit, left uncut}",
     ),
     CommandSpec::new("cam.pocket", "2D Pocket", pocket_cmd).at("MANUFACTURE", "MILLING").icon("pocket").params(
-        "setup; name; tool (number); outer: [[x,y],…] (or regions); holes?; stepover? (default half the tool diameter); \
-         climb?; stock_to_leave?; tolerance?; ramp_angle?: deg; clearance?; retract?; top?; bottom; stepdown?; \
-         feed?; plunge_feed?; spindle_rpm?; coolant?; cut?",
+        "setup; name; tool (number); outer: [[x,y],…] (or regions, or sketch with profiles?, rotate?, at? as cam.contour \
+         takes them); holes?; stepover? (default the tool's, else half its diameter); climb?; stock_to_leave?; tolerance?; \
+         ramp_angle?: deg; clearance?; retract?; top?; bottom; stepdown?; feed?; plunge_feed?; spindle_rpm?; coolant?; \
+         cut? → {setup, operation, bounds, too_small?}",
     ),
     CommandSpec::new("cam.delete_op", "Delete CAM Operation", delete_op).at("MANUFACTURE", "MILLING").icon("delete").params("setup; name"),
     CommandSpec::new("cam.post", "Post Process", post_cmd).icon("post").noundo().params(
         "setup; post?: rs274 | name of a saved post (default rs274); program?: name (default the setup's); \
-         verify?: bool (default true: read the G-code back and check it against the toolpaths) → \
-         {gcode, extension, post, operations, readback?}",
+         verify?: bool (default true: read the G-code back and check it against the toolpaths); path?: file to write the \
+         program to (then the result has `lines` instead of `gcode`) → {gcode | path, lines, extension, post, operations, \
+         readback?}",
     ),
     CommandSpec::new("cam.post.define", "Define Post", post_define_cmd).icon("post").params(
         "post: {name, extension, units, decimals, feed_decimals, comments, header, tool_change, tool_change_first, spindle_on, \
@@ -164,9 +176,13 @@ fn op_cmd(s: &mut Session, p: &Value, cmd: &str, is_contour: bool) -> Result<Val
     let tool_n =
         num(p, "tool").filter(|n| *n >= 1.0 && n.fract() == 0.0).map(|n| n as u32).ok_or_else(|| bad(cmd, "`tool` must be a tool number"))?;
     let tool = s.doc.cam.tool(tool_n).cloned().ok_or_else(|| bad(cmd, format!("no tool {tool_n} (cam.tool first)")))?;
-    let regions = regions_param(cmd, p)?;
+    let regions = regions_param(s, cmd, p)?;
     let cut = cut_param(cmd, p, &tool)?;
-    let spindle_rpm = num(p, "spindle_rpm").or(tool.spindle_rpm);
+    // A machine runs what the program says: no speed made up for a tool that has none.
+    let spindle_rpm = num(p, "spindle_rpm")
+        .or(tool.spindle_rpm)
+        .ok_or_else(|| bad(cmd, format!("no spindle speed: give `spindle_rpm` or set tool {tool_n}'s (cam.tool spindle_rpm)")))?;
+    let spindle_rpm = Some(spindle_rpm);
     let coolant = bool_(p, "coolant").unwrap_or(false);
     let op = if is_contour {
         let mut params = default_contour_params();
@@ -206,6 +222,7 @@ fn op_cmd(s: &mut Session, p: &Value, cmd: &str, is_contour: bool) -> Result<Val
     op.validate().map_err(|e| bad(cmd, e.to_string()))?;
     // Prove the toolpath builds before saving the operation.
     build_path(&tool, &op).map_err(|e| bad(cmd, e))?;
+    let (bounds, too_small) = reach_report(&tool, &op);
     let doc = s.doc_mut();
     let setup = doc.cam.setup_mut(&setup_name).ok_or_else(|| bad(cmd, format!("no setup `{setup_name}` (cam.setup first)")))?;
     if let Some(slot) = setup.operations.iter_mut().find(|o| o.name() == name) {
@@ -216,7 +233,43 @@ fn op_cmd(s: &mut Session, p: &Value, cmd: &str, is_contour: bool) -> Result<Val
         }
         setup.operations.push(op);
     }
-    Ok(json!({"setup": setup_name, "operation": name}))
+    let mut out = json!({"setup": setup_name, "operation": name, "bounds": bounds});
+    if !too_small.is_empty() {
+        out["too_small"] = json!(too_small);
+    }
+    Ok(out)
+}
+
+/// The bounds of an operation's regions, and the openings its tool cannot enter: holes of a part
+/// cut round the outside, or regions cut or cleared from the inside, narrower than the tool. The
+/// offset drops them, so they would be left uncut without a word.
+fn reach_report(tool: &Tool, op: &CamOperation) -> (Value, Vec<Value>) {
+    let (regions, inside, leave) = match op {
+        CamOperation::Contour { regions, params, .. } => (regions, params.side != Side::Outside, params.stock_to_leave),
+        CamOperation::Pocket { regions, params, .. } => (regions, true, params.stock_to_leave),
+    };
+    let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for p in regions.iter().flat_map(|r| &r.outer) {
+        (lo[0], lo[1], hi[0], hi[1]) = (lo[0].min(p[0]), lo[1].min(p[1]), hi[0].max(p[0]), hi[1].max(p[1]));
+    }
+    let reach = tool.radius() + leave;
+    let mut small = Vec::new();
+    for region in regions.iter().filter_map(|r| r.to_region().ok()) {
+        let openings: Vec<_> = if inside { vec![region.outer] } else { region.holes };
+        for lp in openings {
+            // Inscribed radius within a hundredth of a millimetre is enough to tell.
+            let r = lp.inradius(0.01);
+            if r < reach - 1e-6 {
+                let pts = lp.polyline(0.05).into_vec();
+                let (mut a, mut b) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+                for q in &pts {
+                    (a[0], a[1], b[0], b[1]) = (a[0].min(q.x), a[1].min(q.y), b[0].max(q.x), b[1].max(q.y));
+                }
+                small.push(json!({"min": a, "max": b, "widest_circle": 2.0 * r}));
+            }
+        }
+    }
+    (json!({"min": lo, "max": hi}), small)
 }
 
 fn parse_side(cmd: &str, side: &str) -> Result<Side> {
@@ -228,7 +281,10 @@ fn parse_side(cmd: &str, side: &str) -> Result<Side> {
     }
 }
 
-fn regions_param(cmd: &str, p: &Value) -> Result<Vec<PolygonRegion>> {
+fn regions_param(s: &Session, cmd: &str, p: &Value) -> Result<Vec<PolygonRegion>> {
+    if p.get("sketch").is_some() {
+        return sketch_regions(s, cmd, p);
+    }
     if let Some(arr) = p.get("regions").and_then(Value::as_array) {
         return arr.iter().map(|v| polygon_region(cmd, v)).collect();
     }
@@ -255,6 +311,75 @@ fn regions_param(cmd: &str, p: &Value) -> Result<Vec<PolygonRegion>> {
     let region = PolygonRegion { outer: outer.into_iter().map(|p| [p.x, p.y]).collect(), holes };
     region.validate().map_err(|e| bad(cmd, e.to_string()))?;
     Ok(vec![region])
+}
+
+/// An operation's regions from a sketch's profiles: by default every profile that is not the
+/// inside of another one's hole (so the part, not its openings), turned by `rotate` and moved so
+/// the lower left corner of their bounds lies at `at`.
+fn sketch_regions(s: &Session, cmd: &str, p: &Value) -> Result<Vec<PolygonRegion>> {
+    let id = super::features::feature_sketch(s, p, cmd)?;
+    let st = s.model.state();
+    let ss = st.sketch(id).ok_or_else(|| EngineError::Other("that sketch is not evaluated".into()))?;
+    let all = &ss.profiles;
+    let in_a_hole = |r: &Region2| {
+        let q = r.interior_point();
+        all.iter().any(|o| o.region.holes.iter().any(|h| h.contains(q)))
+    };
+    let at_point = |pt: Vec2| {
+        all.iter()
+            .filter(|o| o.region.outer.contains(pt) && !o.region.holes.iter().any(|h| h.contains(pt)))
+            .min_by(|a, b| a.area.total_cmp(&b.area))
+            .map(|o| o.region.clone())
+            .ok_or_else(|| bad(cmd, format!("no profile at [{}, {}]", pt.x, pt.y)))
+    };
+    let picked: Vec<Region2> = match super::features::profiles(p, cmd)? {
+        ProfileSel::All => all.iter().map(|o| o.region.clone()).filter(|r| !in_a_hole(r)).collect(),
+        ProfileSel::Indices { indices } => indices
+            .iter()
+            .map(|&i| all.get(i).map(|o| o.region.clone()).ok_or_else(|| bad(cmd, format!("the sketch has no profile {i}"))))
+            .collect::<Result<_>>()?,
+        ProfileSel::Points { points } => points.into_iter().map(at_point).collect::<Result<_>>()?,
+        selection => solidcraft_doc::profile_selection_indices(ss, &selection)
+            .map_err(|e| bad(cmd, e.to_string()))?
+            .into_iter()
+            .filter_map(|i| all.get(i).map(|o| o.region.clone()))
+            .collect(),
+    };
+    if picked.is_empty() {
+        return Err(bad(cmd, "the sketch has no closed profile to cut"));
+    }
+    // Quarter turns only: the part keeps its edges along the machine's axes.
+    let deg = num(p, "rotate").unwrap_or(0.0);
+    let turn = [0.0, 90.0, 180.0, 270.0].iter().position(|&d| d == deg).ok_or_else(|| bad(cmd, "`rotate` must be 0, 90, 180 or 270"))?;
+    let rotate = |q: Vec2| (0..turn).fold(q, |q, _| Vec2::new(-q.y, q.x));
+    let ring = |lp: &solidcraft_geom::Loop2| -> Result<Vec<Vec2>> {
+        let pts: Vec<Vec2> = lp.polyline(PROFILE_TOLERANCE).into_vec().into_iter().map(rotate).collect();
+        if pts.len() > MAX_LOOP_POINTS {
+            return Err(bad(cmd, format!("a profile loop needs more than {MAX_LOOP_POINTS} points within {PROFILE_TOLERANCE} mm")));
+        }
+        Ok(pts)
+    };
+    let mut loops: Vec<(Vec<Vec2>, Vec<Vec<Vec2>>)> =
+        picked.iter().map(|r| Ok((ring(&r.outer)?, r.holes.iter().map(ring).collect::<Result<Vec<_>>>()?))).collect::<Result<_>>()?;
+    if let Some(at) = p.get("at") {
+        let at = vec2(at).ok_or_else(|| bad(cmd, "`at` must be [x, y]"))?;
+        let lo = loops.iter().flat_map(|(o, _)| o).fold(Vec2::new(f64::INFINITY, f64::INFINITY), |m, q| Vec2::new(m.x.min(q.x), m.y.min(q.y)));
+        let shift = at - lo;
+        for (outer, holes) in &mut loops {
+            for q in outer.iter_mut().chain(holes.iter_mut().flatten()) {
+                *q += shift;
+            }
+        }
+    }
+    loops
+        .into_iter()
+        .map(|(outer, holes)| {
+            let xy = |pts: Vec<Vec2>| pts.into_iter().map(|q| [q.x, q.y]).collect::<Vec<_>>();
+            let region = PolygonRegion { outer: xy(outer), holes: holes.into_iter().map(xy).collect() };
+            region.validate().map_err(|e| bad(cmd, e.to_string()))?;
+            Ok(region)
+        })
+        .collect()
 }
 
 fn polygon_region(cmd: &str, v: &Value) -> Result<PolygonRegion> {
@@ -294,8 +419,11 @@ fn cut_param(cmd: &str, p: &Value, tool: &Tool) -> Result<Cut> {
     let clearance = num(p, "clearance").unwrap_or(10.0);
     let depth = (top - bottom).abs().max(1e-9);
     let stepdown = num(p, "stepdown").or(tool.stepdown).unwrap_or(depth);
-    let feed = num(p, "feed").or(tool.feed).unwrap_or(600.0);
-    let plunge = num(p, "plunge_feed").or(tool.plunge_feed).unwrap_or(200.0);
+    let n = tool.number;
+    let feed = num(p, "feed").or(tool.feed).ok_or_else(|| bad(cmd, format!("no feed: give `feed` or set tool {n}'s (cam.tool feed)")))?;
+    let plunge = num(p, "plunge_feed")
+        .or(tool.plunge_feed)
+        .ok_or_else(|| bad(cmd, format!("no plunge feed: give `plunge_feed` or set tool {n}'s (cam.tool plunge_feed)")))?;
     let mut cut = default_cut(bottom, stepdown);
     cut.heights = Heights { clearance, retract, top, bottom };
     cut.feeds = Feeds { cut: feed, plunge };
@@ -342,7 +470,7 @@ fn post_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let gcode = emit(&program, &post).map_err(|e| bad(cmd, e.to_string()))?;
     let mut out = json!({
-        "gcode": gcode,
+        "lines": gcode.lines().count(),
         "extension": post.extension,
         "post": post.name,
         "operations": program.operations.len(),
@@ -360,6 +488,13 @@ fn post_cmd(s: &mut Session, p: &Value) -> Result<Value> {
             "cut_minutes": rb.cut_minutes,
             "within": rb.within(),
         });
+    }
+    // Written only once it has read back as the toolpaths.
+    if let Some(path) = str_(p, "path").map(str::trim).filter(|x| !x.is_empty()) {
+        solidcraft_io::vfs::write(path, gcode.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        out["path"] = json!(path);
+    } else {
+        out["gcode"] = json!(gcode);
     }
     Ok(out)
 }
@@ -514,7 +649,11 @@ mod tests {
     #[test]
     fn list_and_delete() {
         let mut s = Session::default();
-        run(&mut s, "cam.tool", json!({"number": 2, "diameter": 3, "flute_length": 12, "kind": "ball_endmill"}));
+        run(
+            &mut s,
+            "cam.tool",
+            json!({"number": 2, "diameter": 3, "flute_length": 12, "kind": "ball_endmill", "spindle_rpm": 18000, "feed": 900, "plunge_feed": 300}),
+        );
         run(&mut s, "cam.setup", json!({"name": "S"}));
         run(&mut s, "cam.contour", json!({"setup": "S", "name": "C", "tool": 2, "outer": [[0,0],[20,0],[20,10],[0,10]], "bottom": -2}));
         let list = run(&mut s, "cam.list", json!({}));
@@ -531,7 +670,7 @@ mod tests {
         let mut s = Session::default();
         let ring =
             |rpm: u32| json!({"setup": "Top", "name": "Ring", "tool": 1, "outer": [[0,0],[40,0],[40,30],[0,30]], "bottom": -2, "spindle_rpm": rpm});
-        run(&mut s, "cam.tool", json!({"number": 1, "diameter": 6, "flute_length": 20}));
+        run(&mut s, "cam.tool", json!({"number": 1, "diameter": 6, "flute_length": 20, "feed": 1200, "plunge_feed": 400}));
         run(&mut s, "cam.setup", json!({"name": "Top"}));
         run(&mut s, "cam.contour", ring(2000));
         let mut post = serde_json::to_value(Post::rs274()).unwrap();
@@ -569,5 +708,58 @@ mod tests {
         assert!(s.execute("cam.post.define", &json!({"post": broken})).is_err());
         assert!(s.execute("cam.post.define", &json!({"post": "rs274"})).is_err());
         assert!(s.execute("cam.post.define", &json!({"name": "missing", "delete": true})).is_err());
+    }
+
+    #[test]
+    fn a_part_drawn_in_a_sketch_is_cut_free_and_written_to_a_file() {
+        let mut s = Session::default();
+        // A 100 × 50 plate with a round hole, a square one and a 4 mm hole a 6 mm tool can't enter.
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Plate"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [100, 50]}));
+        run(&mut s, "sketch.circle.center", json!({"center": [30, 25], "radius": 10}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [60, 15], "p1": [80, 35]}));
+        run(&mut s, "sketch.circle.center", json!({"center": [90, 40], "radius": 2}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "cam.tool", json!({"number": 24, "diameter": 6, "flute_length": 25}));
+        run(&mut s, "cam.setup", json!({"name": "Sheet", "stock": {"min": [0, 0, -18], "max": [70, 120, 0]}}));
+
+        // Cutting data are the tool's or the operation's, never made up.
+        let op =
+            json!({"setup": "Sheet", "name": "Part", "tool": 24, "sketch": "Plate", "rotate": 90, "at": [10, 10], "bottom": -18.3, "stepdown": 6.1});
+        let refused = s.execute("cam.contour", &op).unwrap_err().to_string();
+        assert!(refused.contains("no feed"), "{refused}");
+        run(&mut s, "cam.tool", json!({"number": 24, "diameter": 6, "flute_length": 25, "spindle_rpm": 16700, "feed": 4010, "plunge_feed": 1203}));
+
+        // The plate, not the insides of its holes; turned upright and moved to (10, 10).
+        let made = run(&mut s, "cam.contour", op);
+        assert_eq!(made["bounds"], json!({"min": [10.0, 10.0], "max": [60.0, 110.0]}));
+        let Some(CamOperation::Contour { regions, .. }) = s.doc.cam.setups[0].operations.first() else { panic!("{:?}", s.doc.cam) };
+        assert_eq!((regions.len(), regions[0].holes.len()), (1, 3));
+        let small = made["too_small"].as_array().unwrap();
+        assert_eq!(small.len(), 1, "{made}");
+        assert!((small[0]["widest_circle"].as_f64().unwrap() - 4.0).abs() < 0.05, "{made}");
+        assert!(
+            s.execute("cam.contour", &json!({"setup": "Sheet", "name": "X", "tool": 24, "sketch": "Plate", "rotate": 45, "bottom": -1})).is_err()
+        );
+
+        // One hole picked by a point inside it, cut from the inside.
+        let hole = run(
+            &mut s,
+            "cam.contour",
+            json!({"setup": "Sheet", "name": "Hole", "tool": 24, "sketch": "Plate", "profiles": [{"point": [30, 25]}], "side": "inside", "bottom": -1}),
+        );
+        assert_eq!(hole["bounds"], json!({"min": [20.0, 15.0], "max": [40.0, 35.0]}));
+        run(&mut s, "cam.delete_op", json!({"setup": "Sheet", "name": "Hole"}));
+
+        let dir = std::env::temp_dir().join(format!("solidcraft-cam-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Plate.ngc");
+        let posted = run(&mut s, "cam.post", json!({"setup": "Sheet", "path": file.to_string_lossy()}));
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(posted.get("gcode").is_none() && posted["readback"]["within"] == json!(true), "{posted}");
+        assert_eq!(posted["lines"].as_u64(), Some(text.lines().count() as u64));
+        // Cut through: every loop goes below the stock, the outline last.
+        assert!(text.contains("Z-18.3") && text.contains("S16700") && text.contains("F4010"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
