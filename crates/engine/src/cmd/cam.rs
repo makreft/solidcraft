@@ -2,7 +2,7 @@
 //! `solidcraft-cam`. Toolpaths are computed at post time and never stored on the design.
 
 use serde_json::{Value, json};
-use solidcraft_cam::{Cut, Feeds, Heights, Operation, Post, Program, Side, Tool, ToolKind, contour, emit, pocket, readback};
+use solidcraft_cam::{Cut, Feeds, Heights, Operation, Post, Program, Side, Tabs, Tool, ToolKind, contour, emit, pocket, readback};
 use solidcraft_doc::ProfileSel;
 use solidcraft_doc::cam::{
     CamOperation, CamSettings, CamSetup, MAX_LOOP_POINTS, MAX_OPS, MAX_POSTS, MAX_SETUPS, MAX_TOOLS, PolygonRegion, StockBox, default_contour_params,
@@ -32,16 +32,20 @@ pub static COMMANDS: &[CommandSpec] = &[
          within 0.005 mm), rotate?: 0|90|180|270 (deg, about the sketch origin), at?: [x,y] (where the lower left corner \
          of the profiles' bounds goes; default where they are)); holes?: [[[x,y],…]]; side?: outside|inside|on (default \
          outside: a part with holes is cut free, every hole before the outline round it); climb?: bool (default true); \
-         stock_to_leave?; tolerance?; ramp_angle?: deg (default 0); clearance?; retract?; top?; bottom (required unless \
-         cut given); stepdown?; feed?; plunge_feed?; spindle_rpm? (feeds and speed default to the tool's; refused when \
-         neither has them); coolant?; cut?: {heights, feeds, stepdown} → {setup, operation, bounds, too_small?: \
-         openings the tool does not fit, left uncut}",
+         stock_to_leave?; tolerance?; ramp_angle?: deg (default 0); tabs?: true (8 wide, 3 high, about every 250 mm, \
+         holes too) | {width?, height?, spacing?, inner?: bool (a part's holes get tabs too, default true)} (mm; bridges \
+         left on the last passes so a part cut through stays in the stock; none on a loop shorter than four of them); \
+         dogbones?: bool (notch every inside corner the tool leaves round, so a square part fits; default false); \
+         clearance?; retract?; top?; bottom (required unless cut given); stepdown?; feed?; plunge_feed?; spindle_rpm? \
+         (feeds and speed default to the tool's; refused when neither has them); coolant?; cut?: {heights, feeds, \
+         stepdown} → {setup, operation, bounds, too_small?: openings the tool does not fit, left uncut}",
     ),
     CommandSpec::new("cam.pocket", "2D Pocket", pocket_cmd).at("MANUFACTURE", "MILLING").icon("pocket").params(
         "setup; name; tool (number); outer: [[x,y],…] (or regions, or sketch with profiles?, rotate?, at? as cam.contour \
          takes them); holes?; stepover? (default the tool's, else half its diameter); climb?; stock_to_leave?; tolerance?; \
-         ramp_angle?: deg; clearance?; retract?; top?; bottom; stepdown?; feed?; plunge_feed?; spindle_rpm?; coolant?; \
-         cut? → {setup, operation, bounds, too_small?}",
+         ramp_angle?: deg; dogbones?: bool (notch the pocket's inside corners, so a square part fits); clearance?; \
+         retract?; top?; bottom; stepdown?; feed?; plunge_feed?; spindle_rpm?; coolant?; cut? → {setup, operation, \
+         bounds, too_small?}",
     ),
     CommandSpec::new("cam.delete_op", "Delete CAM Operation", delete_op).at("MANUFACTURE", "MILLING").icon("delete").params("setup; name"),
     CommandSpec::new("cam.post", "Post Process", post_cmd).icon("post").noundo().params(
@@ -201,6 +205,8 @@ fn op_cmd(s: &mut Session, p: &Value, cmd: &str, is_contour: bool) -> Result<Val
         if let Some(deg) = num(p, "ramp_angle") {
             params.ramp_angle = deg.to_radians();
         }
+        params.tabs = tabs_param(cmd, p)?;
+        params.dogbones = bool_(p, "dogbones").unwrap_or(false);
         CamOperation::Contour { name: name.clone(), tool: tool_n, regions, params, cut, spindle_rpm, coolant }
     } else {
         let stepover = num(p, "stepover").or(tool.stepover).unwrap_or(tool.diameter * 0.5);
@@ -217,6 +223,7 @@ fn op_cmd(s: &mut Session, p: &Value, cmd: &str, is_contour: bool) -> Result<Val
         if let Some(deg) = num(p, "ramp_angle") {
             params.ramp_angle = deg.to_radians();
         }
+        params.dogbones = bool_(p, "dogbones").unwrap_or(false);
         CamOperation::Pocket { name: name.clone(), tool: tool_n, regions, params, cut, spindle_rpm, coolant }
     };
     op.validate().map_err(|e| bad(cmd, e.to_string()))?;
@@ -270,6 +277,22 @@ fn reach_report(tool: &Tool, op: &CamOperation) -> (Value, Vec<Value>) {
         }
     }
     (json!({"min": lo, "max": hi}), small)
+}
+
+/// `tabs`: `true` for the usual ones, or some of them changed; `false` or left out: none.
+fn tabs_param(cmd: &str, p: &Value) -> Result<Option<Tabs>> {
+    let usual = Tabs { width: 8.0, height: 3.0, spacing: 250.0, inner: true };
+    match p.get("tabs") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(None),
+        Some(Value::Bool(true)) => Ok(Some(usual)),
+        Some(t @ Value::Object(_)) => Ok(Some(Tabs {
+            width: num(t, "width").unwrap_or(usual.width),
+            height: num(t, "height").unwrap_or(usual.height),
+            spacing: num(t, "spacing").unwrap_or(usual.spacing),
+            inner: bool_(t, "inner").unwrap_or(usual.inner),
+        })),
+        Some(_) => Err(bad(cmd, "`tabs` must be true, false or {width, height, spacing, inner}")),
+    }
 }
 
 fn parse_side(cmd: &str, side: &str) -> Result<Side> {
@@ -751,6 +774,18 @@ mod tests {
         assert_eq!(hole["bounds"], json!({"min": [20.0, 15.0], "max": [40.0, 35.0]}));
         run(&mut s, "cam.delete_op", json!({"setup": "Sheet", "name": "Hole"}));
 
+        // Tabs hold the plate (and its holes' waste), dogbones notch the square hole's corners.
+        let held = json!({"setup": "Sheet", "name": "Part", "tool": 24, "sketch": "Plate", "rotate": 90, "at": [10, 10], "bottom": -18.3,
+            "stepdown": 6.1, "tabs": true, "dogbones": true});
+        run(&mut s, "cam.contour", held.clone());
+        let Some(CamOperation::Contour { params, .. }) = s.doc.cam.setups[0].operations.first() else { panic!("{:?}", s.doc.cam) };
+        assert_eq!((params.tabs.map(|t| (t.width, t.height, t.inner)), params.dogbones), (Some((8.0, 3.0, true)), true));
+        for bad_tabs in [json!({"height": 18.3}), json!("yes"), json!({"width": -1})] {
+            let mut op = held.clone();
+            op["tabs"] = bad_tabs.clone();
+            assert!(s.execute("cam.contour", &op).is_err(), "{bad_tabs}");
+        }
+
         let dir = std::env::temp_dir().join(format!("solidcraft-cam-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("Plate.ngc");
@@ -758,8 +793,8 @@ mod tests {
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(posted.get("gcode").is_none() && posted["readback"]["within"] == json!(true), "{posted}");
         assert_eq!(posted["lines"].as_u64(), Some(text.lines().count() as u64));
-        // Cut through: every loop goes below the stock, the outline last.
-        assert!(text.contains("Z-18.3") && text.contains("S16700") && text.contains("F4010"));
+        // Cut through, but the last pass rises over the tabs, 3 mm above the bottom.
+        assert!(text.contains("Z-18.3") && text.contains("Z-15.3") && text.contains("S16700") && text.contains("F4010"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
