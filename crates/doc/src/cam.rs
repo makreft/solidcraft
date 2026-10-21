@@ -254,12 +254,12 @@ impl CamOperation {
 
 /// Default contour params for a new operation.
 pub fn default_contour_params() -> ContourParams {
-    ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 }
+    ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones: false }
 }
 
 /// Default pocket params; `stepover` must still be set by the caller.
 pub fn default_pocket_params(stepover: f64) -> PocketParams {
-    PocketParams { stepover, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 }
+    PocketParams { stepover, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false }
 }
 
 /// Default cut: clearance 10, retract 2, top 0, bottom `bottom`, feeds 600/200, stepdown from depth.

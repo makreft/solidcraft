@@ -9,7 +9,7 @@ use solidcraft_geom::{Region2, Vec2, Vec3};
 use crate::check::verify;
 use crate::offset::{Shape, reversed};
 use crate::path::{MAX_MOVES, Move, Toolpath};
-use crate::piece::Piece;
+use crate::piece::{Piece, turn};
 use crate::tool::{Tool, ToolKind};
 use crate::{CamError, Result, invalid};
 
@@ -21,6 +21,11 @@ const MAX_RINGS: usize = 2_000;
 const MAX_RAMP_LAPS: f64 = 2000.0;
 /// Largest coordinate or height (mm).
 const MAX_COORD: f64 = 1.0e6;
+/// Most tabs on one loop.
+const MAX_TABS: usize = 1000;
+/// A corner of the toolpath that turns away from the material by more than this (radians) gets
+/// a dogbone; the slight bends of a curve drawn as short lines do not.
+const DOGBONE_MIN_TURN: f64 = 0.5;
 
 /// The Z levels of an operation (work coordinates, mm).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -116,6 +121,42 @@ pub struct ContourParams {
     pub tolerance: f64,
     /// Steepest descent into each depth pass, along the profile (radians); 0 plunges straight down.
     pub ramp_angle: f64,
+    /// Bridges left standing on the last passes, so a part cut free stays in the stock.
+    #[serde(default)]
+    pub tabs: Option<Tabs>,
+    /// At every inside corner the tool cannot reach (it leaves its radius there), it goes in
+    /// along the corner's bisector until it touches the corner and comes back: a round notch
+    /// past the corner, so a square part fits all the way in.
+    #[serde(default)]
+    pub dogbones: bool,
+}
+
+/// Holding tabs of a contour: on the passes below their top the tool rises over each tab and
+/// comes back down at 45°, never straight down.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Tabs {
+    /// Width of a tab at its top, in the material along the contour (mm).
+    pub width: f64,
+    /// Height of a tab above the bottom (mm).
+    pub height: f64,
+    /// About one tab every this far along a loop, at least two (mm). A loop shorter than four
+    /// tabs' footprints gets none: a small hole's waste comes free.
+    pub spacing: f64,
+    /// Whether loops inside another one of the operation (a part's holes) get tabs too, holding
+    /// their waste; otherwise only the outlines.
+    pub inner: bool,
+}
+
+impl Tabs {
+    fn validate(&self, h: &Heights) -> Result<()> {
+        if !(self.width > 0.0 && self.width <= 1000.0) || !(self.spacing > 0.0 && self.spacing <= MAX_COORD) {
+            return invalid("tabs need a width above 0 (at most 1 m) and a spacing above 0");
+        }
+        if !(self.height > 0.0) || !(h.bottom + self.height < h.top) {
+            return invalid("tabs must be above 0 high and lower than the cut is deep");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -129,6 +170,10 @@ pub struct PocketParams {
     pub tolerance: f64,
     /// Steepest descent into uncut material, along the first pass (radians); 0 plunges straight down.
     pub ramp_angle: f64,
+    /// Dogbones in the pocket's inside corners, as a contour makes them: so a square part fits
+    /// all the way into a pocket made for it.
+    #[serde(default)]
+    pub dogbones: bool,
 }
 
 /// Collects moves, keeping the tool's position.
@@ -209,14 +254,52 @@ impl Builder {
         }
     }
 
-    fn cut_loop(&mut self, lp: &[Piece], z: f64) -> Result<()> {
-        lp.iter().try_for_each(|piece| self.cut_piece(piece, z, z))
+    fn cut_loop(&mut self, lp: &[Piece], z: f64, tabs: Option<&Terrain>) -> Result<()> {
+        match tabs {
+            Some(t) => self.cut_over(lp, z, z, t),
+            None => lp.iter().try_for_each(|piece| self.cut_piece(piece, z, z)),
+        }
+    }
+
+    /// Once along `lp`, from depth `z0` at its start evenly to `z1` at its end, but never below
+    /// the tabs' floor: pieces are split where the floor bends or meets that depth, so every
+    /// move stays straight (or a helix) in Z.
+    fn cut_over(&mut self, lp: &[Piece], z0: f64, z1: f64, tabs: &Terrain) -> Result<()> {
+        let total: f64 = lp.iter().map(Piece::length).sum();
+        let nominal = |s: f64| if total > 0.0 { z0 + (z1 - z0) * s / total } else { z1 };
+        let z = |s: f64| nominal(s).max(tabs.floor(s));
+        let mut s0 = 0.0;
+        for piece in lp {
+            let len = piece.length();
+            let s1 = s0 + len;
+            let mut at: Vec<f64> = tabs.flats.iter().flat_map(|&(a, b)| [a, b]).filter(|&k| k > s0 && k < s1).collect();
+            at.extend([s0, s1]);
+            at.sort_by(f64::total_cmp);
+            let crossings: Vec<f64> = at
+                .windows(2)
+                .filter_map(|w| {
+                    let (fa, fb) = (nominal(w[0]) - tabs.floor(w[0]), nominal(w[1]) - tabs.floor(w[1]));
+                    (fa.is_finite() && fb.is_finite() && fa * fb < 0.0).then(|| w[0] + (w[1] - w[0]) * fa / (fa - fb))
+                })
+                .collect();
+            at.extend(crossings);
+            at.sort_by(f64::total_cmp);
+            for w in at.windows(2) {
+                if w[1] - w[0] <= 1e-9 {
+                    continue;
+                }
+                let part = if len > 0.0 { piece.sub((w[0] - s0) / len, (w[1] - s0) / len) } else { *piece };
+                self.cut_piece(&part, z(w[0]), z(w[1]))?;
+            }
+            s0 = s1;
+        }
+        Ok(())
     }
 
     /// Goes down to `z` along `lp`, no steeper than `angle`, round as often as that takes; the
     /// tool ends where the loop starts. Straight down when there is no angle or the loop is too
     /// short to ramp along.
-    fn ramp_loop(&mut self, lp: &[Piece], z: f64, angle: f64) -> Result<()> {
+    fn ramp_loop(&mut self, lp: &[Piece], z: f64, angle: f64, tabs: Option<&Terrain>) -> Result<()> {
         let Some(from) = self.pos.map(|p| p.z) else { return Err(CamError::Unsafe("a ramp before the first positioning move".into())) };
         let drop = from - z;
         if !(drop > 1e-9) {
@@ -226,6 +309,13 @@ impl Builder {
         let laps = (drop / angle.tan() / length - 1e-9).ceil().max(1.0);
         if !(angle > 0.0) || !(length > 1e-3) || !(laps <= MAX_RAMP_LAPS) {
             return self.plunge_to(z);
+        }
+        if let Some(t) = tabs {
+            for lap in 0..laps as usize {
+                let (k0, k1) = (lap as f64 / laps, (lap as f64 + 1.0) / laps);
+                self.cut_over(lp, from - drop * k0, from - drop * k1, t)?;
+            }
+            return Ok(());
         }
         let total = laps * length;
         let mut done = 0.0;
@@ -285,6 +375,9 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
     cut.validate()?;
     check_leave(params.stock_to_leave)?;
     check_ramp(params.ramp_angle)?;
+    if let Some(t) = &params.tabs {
+        t.validate(&cut.heights)?;
+    }
     let shape = Shape::from_regions(regions, params.tolerance)?;
     let away = tool.radius() + params.stock_to_leave;
     let mut loops = match params.side {
@@ -304,20 +397,156 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
     let natural_is_climb = params.side != Side::Outside;
     let levels = cut.levels()?;
     let mut b = Builder::new(cut);
-    for lp in &loops {
-        let lp = if params.climb == natural_is_climb { lp.clone() } else { reversed(lp) };
+    for natural in &loops {
+        // The material is on the left of a loop round a part, on the right of one inside an opening.
+        let material_left = params.side == Side::Outside;
+        let lp = match params.side {
+            Side::On => natural.clone(),
+            _ if params.dogbones => with_dogbones(natural, away, material_left),
+            _ => natural.clone(),
+        };
+        let lp = if params.climb == natural_is_climb { lp } else { reversed(&lp) };
+        // A loop with the regions on its right lies inside another one: a part's hole.
+        let inner = natural.iter().map(Piece::area_term).sum::<f64>() < 0.0;
+        let planned = params.tabs.filter(|t| t.inner || !inner).and_then(|t| plan_tabs(&lp, &t, tool.diameter, cut.heights.bottom));
+        let (lp, tabs) = match planned {
+            Some((lp, terrain)) => (lp, Some(terrain)),
+            None => (lp, None),
+        };
         let Some(first) = lp.first() else { continue };
         b.travel_to(first.start())?;
         // Down to the last pass (through what it cut), then into the material along the loop.
         b.plunge_to(cut.heights.top)?;
         for &z in &levels {
-            b.ramp_loop(&lp, z, params.ramp_angle)?;
-            b.cut_loop(&lp, z)?;
+            b.ramp_loop(&lp, z, params.ramp_angle, tabs.as_ref())?;
+            b.cut_loop(&lp, z, tabs.as_ref())?;
             b.cut_to(first.start(), z)?;
         }
         b.retract()?;
     }
     b.finish()
+}
+
+/// `lp` with a dogbone at every corner where it turns away from the material: out along the
+/// corner's bisector until the tool, `away` from the wall, is that far from the corner too, and
+/// back. Very sharp corners (where that would reach out more than four times `away`) are left.
+fn with_dogbones(lp: &[Piece], away: f64, material_left: bool) -> Vec<Piece> {
+    let free = |t: Vec2| if material_left { -t.perp() } else { t.perp() };
+    let mut out = Vec::with_capacity(lp.len() * 2);
+    for (piece, next) in lp.iter().zip(lp.iter().cycle().skip(1)) {
+        out.push(*piece);
+        let (t1, t2) = (piece.tangent_at(1.0), next.tangent_at(0.0));
+        let bend = turn(t1, t2);
+        if bend.abs() < DOGBONE_MIN_TURN || (bend > 0.0) == material_left {
+            continue;
+        }
+        // The tool centre sits `away` from both walls: it is `x` from the corner they meet in.
+        let (n1, n2) = (free(t1), free(t2));
+        let k = 1.0 + n1.dot(n2);
+        if !(k > 1e-9) {
+            continue;
+        }
+        let x = (n1 + n2) * (away / k);
+        let reach = x.len() - away;
+        let (Some(dir), true) = (x.normalized(), reach > 1e-6 && reach <= 4.0 * away) else { continue };
+        let c = piece.end();
+        let tip = c - dir * reach;
+        out.push(Piece::Line { a: c, b: tip });
+        out.push(Piece::Line { a: tip, b: c });
+    }
+    out
+}
+
+/// The tabs of one loop: stretches (arc length from the loop's start) where the tool stays at
+/// `top` on the passes below it, coming down at 45° either side.
+struct Terrain {
+    flats: Vec<(f64, f64)>,
+    top: f64,
+}
+
+impl Terrain {
+    /// The lowest the tool may go at `s` along the loop.
+    fn floor(&self, s: f64) -> f64 {
+        self.flats.iter().map(|&(a, b)| self.top - (a - s).max(s - b).max(0.0)).fold(f64::NEG_INFINITY, f64::max)
+    }
+}
+
+/// Where `lp` carries its tabs, with the loop turned to start in the widest gap between them, so
+/// each pass ramps in where no tab stands. About one every `spacing`, at least two, each moved
+/// onto the nearest straight piece that carries its whole footprint (not over a corner or
+/// round a curve) when one is near. `None` for a loop too short for them.
+fn plan_tabs(lp: &[Piece], tabs: &Tabs, diameter: f64, bottom: f64) -> Option<(Vec<Piece>, Terrain)> {
+    let total: f64 = lp.iter().map(Piece::length).sum();
+    // The tool's centre stays up the tab's width plus its own, and comes down over its height.
+    let flat = tabs.width + diameter;
+    let foot = flat + 2.0 * tabs.height;
+    if !(total >= 4.0 * foot) {
+        return None;
+    }
+    let n = ((total / tabs.spacing).ceil() as usize).clamp(2, MAX_TABS);
+    let share = total / n as f64;
+    let mut room = Vec::new();
+    let mut s = 0.0;
+    for p in lp {
+        let len = p.length();
+        if matches!(p, Piece::Line { .. }) && len >= foot {
+            room.push((s + foot / 2.0, s + len - foot / 2.0));
+        }
+        s += len;
+    }
+    let mut centres: Vec<f64> = (0..n)
+        .map(|k| {
+            let want = (k as f64 + 0.5) * share;
+            room.iter()
+                .map(|&(a, b)| want.clamp(a, b))
+                .filter(|c| (c - want).abs() <= share / 2.0)
+                .min_by(|x, y| (x - want).abs().total_cmp(&(y - want).abs()))
+                .unwrap_or(want)
+        })
+        .collect();
+    centres.sort_by(f64::total_cmp);
+    centres.dedup_by(|later, kept| *later - *kept < foot);
+    if centres.len() > 1 && centres[0] + total - centres[centres.len() - 1] < foot {
+        centres.pop();
+    }
+    // The widest gap between footprints, going round.
+    let (gap, _) = centres
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (i, centres.get(i + 1).map_or(centres[0] + total, |&d| d) - c))
+        .max_by(|a, b| a.1.total_cmp(&b.1))?;
+    let start = (centres[gap] + foot / 2.0).rem_euclid(total);
+    let flats = centres
+        .iter()
+        .map(|&c| {
+            let c = (c - start).rem_euclid(total);
+            (c - flat / 2.0, c + flat / 2.0)
+        })
+        .collect();
+    Some((start_at(lp, start), Terrain { flats, top: bottom + tabs.height }))
+}
+
+/// The loop starting `s` along it, the piece there split in two.
+fn start_at(lp: &[Piece], s: f64) -> Vec<Piece> {
+    let mut acc = 0.0;
+    for (i, p) in lp.iter().enumerate() {
+        let len = p.length();
+        if s < acc + len || i + 1 == lp.len() {
+            let t = if len > 0.0 { ((s - acc) / len).clamp(0.0, 1.0) } else { 0.0 };
+            let mut out = Vec::with_capacity(lp.len() + 1);
+            if t < 1.0 - 1e-12 {
+                out.push(p.sub(t, 1.0));
+            }
+            out.extend_from_slice(&lp[i + 1..]);
+            out.extend_from_slice(&lp[..i]);
+            if t > 1e-12 {
+                out.push(p.sub(0.0, t));
+            }
+            return out;
+        }
+        acc += len;
+    }
+    lp.to_vec()
 }
 
 /// Clears `regions` (holes are islands) with rings parallel to the boundary, from the inside out.
@@ -368,6 +597,12 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
         }
         rings = passes;
     }
+    // The ring along the walls (the pocket on its left, the material on its right).
+    if params.dogbones
+        && let Some(walls) = rings.first_mut()
+    {
+        *walls = walls.iter().map(|lp| with_dogbones(lp, wall, false)).collect();
+    }
     let mut b = Builder::new(cut);
     // The depth already cut wherever this pass's rings run.
     let mut cleared = cut.heights.top;
@@ -385,7 +620,7 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
                 _ => {
                     b.travel_to(start)?;
                     b.plunge_to(cleared)?;
-                    b.ramp_loop(&lp, z, params.ramp_angle)?;
+                    b.ramp_loop(&lp, z, params.ramp_angle, None)?;
                 }
             }
             // Rings far apart do not reach into a sharp corner between them: there the tool
