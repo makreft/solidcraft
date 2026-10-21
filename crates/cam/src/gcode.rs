@@ -198,6 +198,21 @@ impl Writer<'_> {
             self.feed(to, feed);
             return Ok(());
         }
+        // A controller that limits the sweep of one block gets the arc in equal parts.
+        if let Some(limit) = self.post.max_arc_sweep.map(f64::to_radians) {
+            let sweep = arc_sweep(from, to, center, ccw);
+            if sweep.abs() > limit + 1e-9 {
+                let start = Vec2::new(from.x, from.y) - center;
+                // At least 1° a part: at most 360 parts.
+                let n = (sweep.abs() / limit).ceil().clamp(2.0, 360.0) as usize;
+                for i in 1..n {
+                    let t = i as f64 / n as f64;
+                    let p = center + Vec2::from_angle(start.angle() + sweep * t) * start.len();
+                    self.arc(p.extend(from.z + (to.z - from.z) * t), center, ccw, feed)?;
+                }
+                return self.arc(to, center, ccw, feed);
+            }
+        }
         let nz = self.coord(to.z);
         let mut words = format!("{} X{nx} Y{ny}", self.motion(if ccw { 3 } else { 2 }));
         if self.z.as_ref() != Some(&nz) {
@@ -220,6 +235,18 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
     if program.operations.len() > MAX_OPERATIONS {
         return Err(CamError::TooLarge(format!("more than {MAX_OPERATIONS} operations")));
     }
+    if post.one_tool {
+        let mut numbers: Vec<u32> = program.operations.iter().map(|op| op.tool.number).collect();
+        numbers.sort_unstable();
+        numbers.dedup();
+        if numbers.len() > 1 {
+            let list = numbers.iter().map(|n| format!("T{n}")).collect::<Vec<_>>().join(", ");
+            return invalid(format!(
+                "post `{}` takes one tool per program, but this one uses {list}: post each tool's operations as a program of its own",
+                plain(&post.name)
+            ));
+        }
+    }
     let mut w = Writer { post, out: String::new(), line: post.line_numbers.map(|n| n.start), x: None, y: None, z: None, pos: None, feed: None };
     let offset = program.work_offset.unwrap_or(1);
     // A post that leaves the offset to the operator can only mean the first one.
@@ -241,6 +268,16 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
         op.tool.validate()?;
         if !(op.spindle_rpm > 0.0) || !(op.spindle_rpm <= 1.0e6) {
             return invalid(format!("operation `{}`: the spindle speed must be above 0", plain(&op.name)));
+        }
+        if let Some(range) = post.spindle_range.filter(|r| !r.contains(op.spindle_rpm)) {
+            return invalid(format!(
+                "operation `{}`: {} rev/min is outside the spindle range of post `{}` ({} to {} rev/min)",
+                plain(&op.name),
+                number(op.spindle_rpm, 0),
+                plain(&post.name),
+                number(range.min, 0),
+                number(range.max, 0)
+            ));
         }
         let speed = number(op.spindle_rpm, 0);
         values.tool = op.tool.number.to_string();

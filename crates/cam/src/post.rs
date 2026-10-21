@@ -98,6 +98,30 @@ pub struct Post {
     /// How a dwell is written: `{seconds}` or `{milliseconds}` (a whole number) stands for its length.
     #[serde(default = "default_dwell")]
     pub dwell: String,
+    /// Largest sweep of one arc block (degrees), for controllers that limit it (to a half turn
+    /// or a quadrant); a longer arc is written as equal parts. `None`: up to a full turn per block.
+    #[serde(default)]
+    pub max_arc_sweep: Option<f64>,
+    /// The spindle speeds the machine runs; a program asking for another is refused.
+    #[serde(default)]
+    pub spindle_range: Option<SpindleRange>,
+    /// Whether a program may use one tool only, for machines that cannot change tools within a
+    /// program: one with more tools is refused rather than written.
+    #[serde(default)]
+    pub one_tool: bool,
+}
+
+/// The spindle speeds a machine runs (rev/min).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpindleRange {
+    pub min: f64,
+    pub max: f64,
+}
+
+impl SpindleRange {
+    pub fn contains(&self, rpm: f64) -> bool {
+        rpm >= self.min && rpm <= self.max
+    }
 }
 
 fn yes() -> bool {
@@ -138,6 +162,9 @@ impl Post {
             trailing_decimal: false,
             two_digit_codes: false,
             dwell: default_dwell(),
+            max_arc_sweep: None,
+            spindle_range: None,
+            one_tool: false,
         }
     }
 
@@ -165,6 +192,12 @@ impl Post {
         }
         if self.line_numbers.is_some_and(|n| n.step == 0) {
             return invalid("the post's line number step must be above 0");
+        }
+        if self.max_arc_sweep.is_some_and(|deg| !(1.0..360.0).contains(&deg)) {
+            return invalid("the post's largest arc sweep must be at least 1° and below 360°");
+        }
+        if self.spindle_range.is_some_and(|r| !(r.min >= 0.0 && r.min <= r.max && r.max <= 1.0e6)) {
+            return invalid("the post's spindle range must run from its lowest to its highest speed, 0 to 1000000 rev/min");
         }
         if self.extension.is_empty() || self.extension.len() > 8 || !self.extension.chars().all(|c| c.is_ascii_alphanumeric()) {
             return invalid("the post's file extension must be 1 to 8 letters or digits");

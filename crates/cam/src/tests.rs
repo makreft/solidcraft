@@ -503,6 +503,87 @@ fn arc_too_short_to_write_is_never_a_full_circle() {
     assert!(!text.contains("G2 ") && !text.contains("G3 "), "{text}");
 }
 
+/// A helix of 270° counter-clockwise from -1 down to -2, then 300° clockwise at -2, both 20 mm
+/// round the origin.
+fn long_arcs_program() -> Program {
+    let at = |deg: f64, z: f64| (Vec2::from_angle(deg.to_radians()) * 20.0).extend(z);
+    let moves = vec![
+        Move::Rapid { to: at(0.0, 10.0) },
+        Move::Rapid { to: at(0.0, 2.0) },
+        Move::Feed { to: at(0.0, -1.0), feed: 200.0 },
+        Move::Arc { to: at(270.0, -2.0), center: v(0.0, 0.0), ccw: true, feed: 600.0 },
+        Move::Arc { to: at(-30.0, -2.0), center: v(0.0, 0.0), ccw: false, feed: 600.0 },
+        Move::Rapid { to: at(-30.0, 10.0) },
+    ];
+    let path = Toolpath { moves };
+    verify(&path, &cut(0.0, -2.0, 1.0).heights).unwrap();
+    Program {
+        work_offset: None,
+        name: "arcs".into(),
+        operations: vec![Operation { name: "Arcs".into(), tool: tool(6.0), spindle_rpm: 12000.0, coolant: false, path }],
+    }
+}
+
+/// The sweep of every arc among `moves` (degrees, counter-clockwise positive).
+fn arc_sweeps(moves: &[Move]) -> Vec<f64> {
+    let mut pos = None;
+    let mut out = Vec::new();
+    for m in moves {
+        if let (Move::Arc { to, center, ccw, .. }, Some(from)) = (m, pos) {
+            out.push(arc_sweep(from, *to, *center, *ccw).to_degrees());
+        }
+        pos = m.target().or(pos);
+    }
+    out
+}
+
+#[test]
+fn arcs_are_split_for_controllers_that_limit_their_sweep() {
+    let program = long_arcs_program();
+    let whole = arc_sweeps(&parse(&emit(&program, &Post::rs274()).unwrap()).unwrap());
+    assert_eq!(whole.len(), 2);
+    close(whole[0], 270.0, 1e-3);
+    close(whole[1], -300.0, 1e-3);
+    // 270° in halves of 135°, 300° in halves of 150°; by quadrant 3 × 90° and 4 × 75°.
+    for (limit, parts) in [(180.0, vec![135.0, 135.0, -150.0, -150.0]), (90.0, vec![90.0, 90.0, 90.0, -75.0, -75.0, -75.0, -75.0])] {
+        let post = Post { max_arc_sweep: Some(limit), ..Post::rs274() };
+        let text = emit(&program, &post).unwrap();
+        let sweeps = arc_sweeps(&parse(&text).unwrap());
+        assert_eq!(sweeps.len(), parts.len(), "{limit}°: {sweeps:?}");
+        for (s, want) in sweeps.iter().zip(&parts) {
+            close(*s, *want, 1e-3);
+        }
+        // The parts follow the helix down and end where the whole arcs end.
+        let r = readback(&text, &program, &post).unwrap();
+        assert!(r.within(), "{limit}°: {r:?}");
+    }
+    // A controller without arcs still gets chords, however the sweep is limited.
+    let chords = Post { arcs: false, max_arc_sweep: Some(90.0), ..Post::rs274() };
+    assert!(arc_sweeps(&parse(&emit(&program, &chords).unwrap()).unwrap()).is_empty());
+}
+
+#[test]
+fn programs_the_machine_cannot_run_are_refused() {
+    // One tool at 3000 rev/min.
+    let mut post = Post { spindle_range: Some(SpindleRange { min: 3000.0, max: 24000.0 }), one_tool: true, ..Post::rs274() };
+    assert!(emit(&drill_program(), &post).is_ok());
+    post.spindle_range = Some(SpindleRange { min: 8000.0, max: 24000.0 });
+    let refused = emit(&drill_program(), &post).unwrap_err().to_string();
+    assert!(refused.contains("3000 rev/min") && refused.contains("8000 to 24000"), "{refused}");
+
+    post.spindle_range = None;
+    let mut two = drill_program();
+    let mut second = two.operations[0].clone();
+    second.tool.number = 4;
+    two.operations.push(second);
+    let refused = emit(&two, &post).unwrap_err().to_string();
+    assert!(refused.contains("T3, T4"), "{refused}");
+    assert!(emit(&two, &Post::rs274()).is_ok(), "a machine that changes tools takes both");
+    // The same tool twice is still one tool.
+    two.operations[1].tool.number = 3;
+    assert!(emit(&two, &post).is_ok());
+}
+
 #[test]
 fn verify_refuses_unsafe_paths() {
     let h = cut(0.0, -5.0, 1.0).heights;
@@ -624,9 +705,14 @@ fn posts_are_data_and_bad_ones_are_refused() {
     assert!(broken(|p| p.extension = "../x".into()));
     assert!(broken(|p| p.spindle_on = vec!["M3".into(); 1000]));
     assert!(broken(|p| p.dwell = "G4 P{minutes}".into()));
+    assert!(broken(|p| p.max_arc_sweep = Some(0.5)));
+    assert!(broken(|p| p.max_arc_sweep = Some(360.0)));
+    assert!(broken(|p| p.max_arc_sweep = Some(f64::NAN)));
+    assert!(broken(|p| p.spindle_range = Some(SpindleRange { min: 24000.0, max: 3000.0 })));
+    assert!(broken(|p| p.spindle_range = Some(SpindleRange { min: f64::NAN, max: 3000.0 })));
     // A post saved before these switches existed reads with what it meant.
     let mut old = serde_json::to_value(Post::rs274()).unwrap();
-    for k in ["helical_arcs", "trailing_decimal", "two_digit_codes", "dwell"] {
+    for k in ["helical_arcs", "trailing_decimal", "two_digit_codes", "dwell", "max_arc_sweep", "spindle_range", "one_tool"] {
         old.as_object_mut().unwrap().remove(k);
     }
     assert_eq!(serde_json::from_value::<Post>(old).unwrap(), Post::rs274());
