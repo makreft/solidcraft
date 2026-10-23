@@ -1223,8 +1223,14 @@ fn placement_digest(doc: &Document, f: &Feature) -> u64 {
     if !to_object && !combine && drawn_tools_change_bodies(&f.kind) {
         return drawn_tools_digest(doc, f);
     }
-    if to_object || placed_mirror || combine {
-        return if doc.occurrences.is_empty() && doc.body_offsets.is_empty() { 0 } else { placements_hash(doc) };
+    if doc.occurrences.is_empty() && doc.body_offsets.is_empty() && (to_object || placed_mirror || combine) {
+        return 0;
+    }
+    if placed_mirror {
+        return placements_hash(doc);
+    }
+    if to_object || combine {
+        return placements_before(doc, f);
     }
     let FeatureKind::Sketch { plane, sketch } = &f.kind else { return 0 };
     let anchor = crate::face_anchor::plane_face_anchor(plane);
@@ -1233,7 +1239,7 @@ fn placement_digest(doc: &Document, f: &Feature) -> u64 {
     {
         return 0;
     }
-    placements_hash(doc)
+    placements_before(doc, f)
 }
 
 /// Every occurrence's placement and every body offset.
@@ -1241,6 +1247,40 @@ fn placements_hash(doc: &Document) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for o in &doc.occurrences {
         o.id.hash(&mut h);
+        o.transform.iter().flatten().for_each(|x| x.to_bits().hash(&mut h));
+    }
+    serde_json::to_string(&doc.body_offsets).unwrap_or_default().hash(&mut h);
+    h.finish()
+}
+
+/// The placements feature `f` can meet where it stands in the timeline: every placement of its
+/// own component and of every component that can hold a body by then (one with an earlier
+/// feature, either end of an earlier transfer, one a body was moved to), and of the components
+/// those sit in, with the bodies' offsets. A component made later, or moved, changes nothing the
+/// feature reads, so it keeps its result: inserting a fastener into an assembly once evaluated
+/// every join and cut before it again, twice over (its new component, then the joint that seats it).
+fn placements_before(doc: &Document, f: &Feature) -> u64 {
+    let mut reach: std::collections::BTreeSet<u64> = std::iter::once(f.component).collect();
+    for g in doc.features.iter().take_while(|g| g.id != f.id) {
+        reach.insert(g.component);
+        if let FeatureKind::BodyTransfer { from, to, .. } = &g.kind {
+            reach.extend([*from, *to]);
+        }
+    }
+    reach.extend(doc.body_components.values().copied());
+    // And what they sit in, up to the root (at most one level more each pass).
+    for _ in 0..=doc.occurrences.len() {
+        let parents: Vec<u64> =
+            doc.occurrences.iter().filter(|o| reach.contains(&o.component) && !reach.contains(&o.parent)).map(|o| o.parent).collect();
+        if parents.is_empty() {
+            break;
+        }
+        reach.extend(parents);
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for o in doc.occurrences.iter().filter(|o| reach.contains(&o.component)) {
+        o.id.hash(&mut h);
+        o.parent.hash(&mut h);
         o.transform.iter().flatten().for_each(|x| x.to_bits().hash(&mut h));
     }
     serde_json::to_string(&doc.body_offsets).unwrap_or_default().hash(&mut h);
@@ -6281,7 +6321,7 @@ fn drawn_tools_digest(doc: &Document, f: &Feature) -> u64 {
     if (!targets && f.participants.is_empty()) || (doc.occurrences.is_empty() && doc.body_offsets.is_empty()) {
         return 0;
     }
-    placements_hash(doc)
+    placements_before(doc, f)
 }
 
 /// The matrix taking the evaluated feature's drawn tools into body `name`'s frame (`None`: the
