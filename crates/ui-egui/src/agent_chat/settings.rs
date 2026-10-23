@@ -183,6 +183,18 @@ pub fn page(app: &mut SolveApp, ui: &mut egui::Ui) {
                 }
             }
         });
+        ui_kit::row(ui, tr("ui.agent_chat_text_size"), |ui| {
+            let mut scale = super::panel::text_scale(app.preferences.agent_chat_text_scale);
+            let r = ui_kit::slider(
+                ui,
+                &mut scale,
+                super::panel::TEXT_SCALE,
+                ui_kit::Slider { step: Some(0.05), format: |v| format!("{:.0} %", v * 100.0), ..Default::default() },
+            );
+            crate::scenario::publish_handle("prefs:agent_chat_text_size", r.rect.center());
+            app.preferences.agent_chat_text_scale = scale;
+        });
+        ui_kit::text(ui, tr("ui.agent_chat_text_size_note"), ui_kit::Text::Note("text_size"));
         ui_kit::row(ui, tr("ui.agent_chat_turn_limit"), |ui| {
             ui_kit::number_field(ui, &mut app.preferences.agent_chat_turn_limit, 1..=200, 1.0, "");
         });

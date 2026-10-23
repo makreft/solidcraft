@@ -25,6 +25,22 @@ thread_local! {
     /// The palette of a theme file (`theme_files`) in place of the built-in one of its base
     /// (dark or light), per thread like the rest. `None`: the built-in palettes.
     static CUSTOM: Cell<Option<Custom>> = const { Cell::new(None) };
+    /// A factor on every font size while one part of the window is drawn ([`with_text_scale`]),
+    /// per thread like the rest. 1 everywhere else.
+    static TEXT_SCALE: Cell<f32> = const { Cell::new(1.0) };
+}
+
+/// Draw with every font size of [`Tokens::get`] times `scale` (the agent chat's text size); the
+/// previous factor comes back afterwards, also when `draw` panics.
+pub fn with_text_scale<R>(scale: f32, draw: impl FnOnce() -> R) -> R {
+    struct Restore(f32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEXT_SCALE.set(self.0);
+        }
+    }
+    let _restore = Restore(TEXT_SCALE.replace(scale));
+    draw()
 }
 
 /// A theme file's palette and whether it is dark.
@@ -542,7 +558,36 @@ impl Tokens {
 
     /// The tokens of the current theme and colour vision mode.
     pub fn get() -> Tokens {
-        Tokens::themed(is_dark(), vision())
+        Tokens::themed(is_dark(), vision()).text_scaled(TEXT_SCALE.get())
+    }
+
+    /// These tokens with every font size times `scale`.
+    pub fn text_scaled(self, scale: f32) -> Tokens {
+        if scale == 1.0 {
+            return self;
+        }
+        let mut t = self;
+        for size in [
+            &mut t.font_badge,
+            &mut t.font_micro,
+            &mut t.font_panel,
+            &mut t.font_small,
+            &mut t.font_caption,
+            &mut t.font_body,
+            &mut t.font_label,
+            &mut t.font_button,
+            &mut t.font_heading,
+            &mut t.font_triad,
+            &mut t.font_compass,
+            &mut t.font_subtitle,
+            &mut t.font_intro,
+            &mut t.font_article_heading,
+            &mut t.font_title,
+            &mut t.font_display,
+        ] {
+            *size *= scale;
+        }
+        t
     }
 
     /// The tokens of a theme and colour vision mode: a theme file's palette when one is on for
@@ -626,6 +671,26 @@ pub fn apply(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
+    /// The agent chat's text size: every font size grows while its part is drawn, nothing else
+    /// does, and the usual sizes come back afterwards, also after a nested scale or a panic.
+    #[test]
+    fn a_text_scale_holds_only_while_its_part_is_drawn() {
+        let normal = super::Tokens::get();
+        let inside = super::with_text_scale(1.5, || {
+            let t = super::Tokens::get();
+            assert_eq!(super::with_text_scale(2.0, || super::Tokens::get().font_body), normal.font_body * 2.0);
+            assert_eq!(super::Tokens::get().font_body, normal.font_body * 1.5);
+            t
+        });
+        assert_eq!(inside.font_body, normal.font_body * 1.5);
+        assert_eq!(inside.font_article_heading, normal.font_article_heading * 1.5);
+        assert_eq!(inside.font_caption, normal.font_caption * 1.5);
+        assert_eq!((inside.space_8, inside.control_height), (normal.space_8, normal.control_height), "only text grows");
+        assert_eq!(super::Tokens::get().font_body, normal.font_body);
+        let _ = std::panic::catch_unwind(|| super::with_text_scale(3.0, || panic!("drawing failed")));
+        assert_eq!(super::Tokens::get().font_body, normal.font_body, "a panic leaves the usual sizes");
+    }
+
     #[test]
     fn tab_accents_map_explicit_tokens_without_changing_model() {
         for dark in [false, true] {

@@ -486,6 +486,9 @@ preference_settings! {
     /// The side the panel docks on (`left` or `right`), its width, and whether it is folded to a strip.
     agent_chat_side: String = "right".into(), PAGE_AI;
     agent_chat_width: f32 = 380.0, PAGE_AI;
+    /// The size of the chat's text (its messages and the input) as a factor on the usual sizes;
+    /// also the A− and A+ buttons under the chat's input.
+    agent_chat_text_scale: f32 = 1.0, PAGE_AI;
     agent_chat_minimized: bool = false, PAGE_AI;
     /// Whether the chat is in its own window instead of the side panel, and that window's place
     /// and size as the system last reported them (`[x, y, width, height]`, points; `x` can be
