@@ -52,7 +52,8 @@ pub const BRIDGE_NAME: &str = "solidcraft-app";
 /// The MCP server the agent starts to reach the design: `solidcraft-cli mcp --connect` bridged to
 /// this app's control port. The server finds the port's token in the token file the app wrote
 /// (docs/control-protocol.md), so the token never travels through the agent, and it keeps its
-/// default folder limits (docs/mcp.md): no `--allow-any-path`.
+/// default folder limits (docs/mcp.md) unless the user lets the agent use the computer
+/// (`agent_computer_access`): then `--allow-any-path`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpBridge {
     pub cli: std::path::PathBuf,
@@ -60,40 +61,61 @@ pub struct McpBridge {
 }
 
 impl McpBridge {
-    pub fn to_json(&self) -> Value {
+    pub fn to_json(&self, any_path: bool) -> Value {
+        let mut args = vec!["mcp".to_string(), "--connect".to_string(), format!("127.0.0.1:{}", self.port)];
+        if any_path {
+            args.push("--allow-any-path".into());
+        }
         json!({
             "name": BRIDGE_NAME,
             "command": self.cli.to_string_lossy(),
-            "args": ["mcp", "--connect", format!("127.0.0.1:{}", self.port)],
+            "args": args,
             "env": [],
         })
     }
 }
 
-/// What every session is told about where it is. Agents that don't read `_meta` ignore it.
-pub const SYSTEM_NOTE: &str = "You are running inside SolidCraft, a parametric 3D CAD application, as the user's assistant. \
+/// Where the agent is and how it reaches the design: the start of every session's note.
+macro_rules! design_note {
+    () => {
+        "You are running inside SolidCraft, a parametric 3D CAD application, as the user's assistant. \
 The open design is reachable through the `solidcraft-app` MCP server: use its tools (list_commands, batch, execute, inspect_design, \
 measure, screenshot, set_parameter, undo) to read and change the design the user is looking at, and verify with measure or \
 inspect_design. Prefer one `batch` over many small calls. Saving, opening or exporting files waits for the user's approval in \
-the chat, and each message allows a limited number of changes. Don't use shell or file tools: work through the SolidCraft tools. \
-Keep answers short.";
+the chat, and each message allows a limited number of changes."
+    };
+}
+
+/// What every session is told about where it is. Agents that don't read `_meta` ignore it.
+pub const SYSTEM_NOTE: &str = concat!(design_note!(), " Don't use shell or file tools: work through the SolidCraft tools. Keep answers short.");
+
+/// The note when the user lets the agent use the computer (`agent_computer_access`).
+pub const SYSTEM_NOTE_COMPUTER: &str = concat!(
+    design_note!(),
+    " The user has also given you this computer: your own shell, file and web tools are on, and SolidCraft's file \
+commands reach any folder. Change the open design only through the SolidCraft tools, never by editing its file. \
+Keep answers short."
+);
 
 /// The Claude Code adapter's own tools that reach the computer rather than the design: turned off
 /// for the session (`_meta.claudeCode.options.disallowedTools`), so it works through SolidCraft's.
 pub const CLAUDE_DISALLOWED_TOOLS: &[&str] =
     &["Bash", "BashOutput", "KillShell", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "WebFetch", "WebSearch", "Task"];
 
-pub fn session_new_params(cwd: &std::path::Path, bridge: Option<&McpBridge>) -> Value {
-    let servers: Vec<Value> = bridge.map(McpBridge::to_json).into_iter().collect();
+/// `computer`: the user lets the agent use the computer (`agent_computer_access`), so its own
+/// tools stay on and the bridge has no folder limits.
+pub fn session_new_params(cwd: &std::path::Path, bridge: Option<&McpBridge>, computer: bool) -> Value {
+    let servers: Vec<Value> = bridge.map(|b| b.to_json(computer)).into_iter().collect();
+    let (note, disallowed) = if computer { (SYSTEM_NOTE_COMPUTER, &[][..]) } else { (SYSTEM_NOTE, CLAUDE_DISALLOWED_TOOLS) };
     json!({
         "cwd": cwd.to_string_lossy(),
         "mcpServers": servers,
         "_meta": {
-            "systemPrompt": {"append": SYSTEM_NOTE},
+            "systemPrompt": {"append": note},
             // Hosts may opt a session out of "bypass permissions" (the Claude adapter reads it):
             // every tool call the agent asks about reaches the panel.
-            // Its own shell and file tools are off: the agent works through SolidCraft's tools.
-            "claudeCode": {"options": {"allowDangerouslySkipPermissions": false, "disallowedTools": CLAUDE_DISALLOWED_TOOLS}},
+            // Its own shell and file tools are off unless the user lets it use the computer.
+            "claudeCode": {"options": {"allowDangerouslySkipPermissions": false, "disallowedTools": disallowed}},
         },
     })
 }
@@ -503,14 +525,33 @@ mod tests {
     #[test]
     fn the_session_gets_the_bridged_mcp_server_without_a_token_or_any_path() {
         let b = McpBridge { cli: "/opt/solidcraft/solidcraft-cli".into(), port: 41234 };
-        let p = session_new_params(std::path::Path::new("/home/u/designs"), Some(&b));
+        let p = session_new_params(std::path::Path::new("/home/u/designs"), Some(&b), false);
         let s = &p["mcpServers"][0];
         assert_eq!(s["name"], BRIDGE_NAME);
         assert_eq!(s["args"], json!(["mcp", "--connect", "127.0.0.1:41234"]));
         let text = p.to_string();
         assert!(!text.contains("allow-any-path") && !text.contains("TOKEN") && !text.contains("token"), "{text}");
         assert!(p["_meta"]["claudeCode"]["options"]["disallowedTools"].as_array().is_some_and(|t| t.iter().any(|x| x == "Bash")));
-        assert_eq!(session_new_params(std::path::Path::new("/tmp"), None)["mcpServers"], json!([]));
+        assert_eq!(p["_meta"]["systemPrompt"]["append"], SYSTEM_NOTE);
+        assert_eq!(session_new_params(std::path::Path::new("/tmp"), None, false)["mcpServers"], json!([]));
+    }
+
+    /// The user lets the agent use the computer: its own tools stay on, the note says so, and the
+    /// bridge reaches any folder (still without the token).
+    #[test]
+    fn a_session_with_the_computer_keeps_the_agents_tools_and_lifts_the_folder_limits() {
+        let b = McpBridge { cli: "/opt/solidcraft/solidcraft-cli".into(), port: 41234 };
+        let p = session_new_params(std::path::Path::new("/home/u"), Some(&b), true);
+        assert_eq!(p["mcpServers"][0]["args"], json!(["mcp", "--connect", "127.0.0.1:41234", "--allow-any-path"]));
+        assert_eq!(p["_meta"]["claudeCode"]["options"]["disallowedTools"], json!([]));
+        assert_eq!(p["_meta"]["claudeCode"]["options"]["allowDangerouslySkipPermissions"], false);
+        assert_eq!(p["_meta"]["systemPrompt"]["append"], SYSTEM_NOTE_COMPUTER);
+        assert!(!p.to_string().contains("TOKEN") && !p.to_string().contains("token"));
+        for note in [SYSTEM_NOTE, SYSTEM_NOTE_COMPUTER] {
+            assert!(note.starts_with("You are running inside SolidCraft") && note.ends_with("Keep answers short."), "{note}");
+            assert!(note.contains(&format!("`{BRIDGE_NAME}` MCP server")));
+        }
+        assert!(!SYSTEM_NOTE_COMPUTER.contains("Don't use shell"));
     }
 
     #[test]

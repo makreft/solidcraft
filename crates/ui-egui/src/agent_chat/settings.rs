@@ -148,6 +148,12 @@ pub fn page(app: &mut SolveApp, ui: &mut egui::Ui) {
             ui_kit::text(ui, tr("ui.ai_mode_all_warning"), ui_kit::Text::Report("permissions_warning", true));
         }
         ui_kit::text(ui, tr("ui.ai_modes_scope"), ui_kit::Text::Note("scope"));
+        let r = ui_kit::checkbox(ui, tr("ui.ai_computer_access"), &mut app.preferences.agent_computer_access);
+        crate::scenario::publish_handle("prefs:ai_computer_access", r.rect.center());
+        ui_kit::text(ui, tr("ui.ai_computer_access_note"), ui_kit::Text::Note("computer_access"));
+        if app.preferences.agent_computer_access && app.preferences.ai_permissions == Mode::All {
+            ui_kit::text(ui, tr("ui.ai_computer_access_warning"), ui_kit::Text::Report("computer_access_warning", true));
+        }
         ui_kit::section(ui, "always_allowed", tr("ui.ai_always_allowed"), true, |ui| {
             let remembered: Vec<_> =
                 app.preferences.agent_always_allow.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect();

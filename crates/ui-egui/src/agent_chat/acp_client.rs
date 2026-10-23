@@ -28,6 +28,7 @@ pub struct AcpBackend {
     proc: AgentProcess,
     cwd: std::path::PathBuf,
     bridge: Option<acp::McpBridge>,
+    computer: bool,
     next_id: u64,
     pending: HashMap<u64, Pending>,
     session: Option<String>,
@@ -50,6 +51,7 @@ impl AcpBackend {
             proc,
             cwd: ctx.cwd,
             bridge: ctx.bridge,
+            computer: ctx.computer,
             next_id: 0,
             pending: HashMap::new(),
             session: None,
@@ -72,7 +74,7 @@ impl AcpBackend {
     }
 
     fn new_session(&mut self) {
-        let params = acp::session_new_params(&self.cwd, self.bridge.as_ref());
+        let params = acp::session_new_params(&self.cwd, self.bridge.as_ref(), self.computer);
         self.request(Pending::SessionNew, "session/new", params);
     }
 
@@ -195,6 +197,11 @@ impl ChatBackend for AcpBackend {
         self.new_session();
     }
 
+    fn set_computer(&mut self, computer: bool, cwd: &std::path::Path) {
+        self.computer = computer;
+        self.cwd = cwd.to_path_buf();
+    }
+
     fn answer_permission(&mut self, key: u64, option: Option<&str>) {
         if let Some(rpc) = self.permissions.remove(&key) {
             self.proc.send(&acp::permission_reply(rpc, option));
@@ -258,7 +265,7 @@ pub fn test_agent(argv: &[String], cwd: &std::path::Path) -> Result<String, Stri
     p.send(&acp::request(1, "initialize", acp::initialize_params(env!("CARGO_PKG_VERSION"))));
     let init = wait_for(&p, 1);
     let result = init.and_then(|v| {
-        p.send(&acp::request(2, "session/new", acp::session_new_params(cwd, None)));
+        p.send(&acp::request(2, "session/new", acp::session_new_params(cwd, None, false)));
         wait_for(&p, 2).map(|_| {
             let who = acp::agent_info(&v);
             crate::i18n::format("ui.ai_test_acp_ok", &[("agent", if who.is_empty() { "?" } else { &who })])
