@@ -1,5 +1,6 @@
 //! Building bodies: extrude and revolve planar regions, primitives.
 
+use truck_modeling::{Homogeneous, InnerSpace};
 use mt::builder;
 use solidcraft_geom::{Grid, Loop2, Plane, Region2, Ring, Seg2, Vec2, Vec3};
 use truck_modeling as mt;
@@ -1756,15 +1757,38 @@ fn revolve_touching_axis(plane: &Plane, numbered: &NumberedLoop, axis_origin: Ve
     })
 }
 
+/// A planar cap on `wires`. truck's `try_attach_plane` wants every control point of the wire
+/// within its tolerance (1e-6) of one plane; the loft re-fits its sections, and on a sketch
+/// plane that is not axis-aligned the fitted control points miss the plane by rounding, so the
+/// cap of a loft between tilted sections failed ("cannot attach a plane to a wire that is not
+/// on one plane"). Fall back to the plane through the points (Newell), accepting a deviation
+/// of up to `CAP_PLANE_TOL`; an axis-aligned section still takes truck's exact plane.
+const CAP_PLANE_TOL: f64 = 1e-2;
+
+fn cap_plane(wires: &[mt::Wire]) -> Result<mt::Face> {
+    let strict = builder::try_attach_plane(wires);
+    let Err(strict_err) = strict else { return strict.map_err(|e| KernelError::Failed(format!("cap: {e}"))) };
+    let pts: Vec<mt::Point3> = wires
+        .iter()
+        .flat_map(|w| w.edge_iter().flat_map(|e| e.oriented_curve().lift_up().control_points().clone().into_iter().map(|p| p.to_point())))
+        .collect();
+    let plane = crate::plane_fit::plane_through(&pts).ok_or_else(|| KernelError::Failed(format!("cap: {strict_err}")))?;
+    let (o, n) = (plane.origin(), plane.normal());
+    let worst = pts.iter().map(|p| (p - o).dot(n).abs()).fold(0.0_f64, f64::max);
+    if worst > CAP_PLANE_TOL {
+        return Err(KernelError::Failed(format!("cap: {strict_err} (the wire leaves its plane by {worst:.2e} mm)")));
+    }
+    mt::Face::try_new(wires.to_owned(), plane.into()).map_err(|e| KernelError::Failed(format!("cap: {e}")))
+}
+
 /// Close a ruled shell (side faces between matching wires, with their provenance as built)
 /// with planar caps into a body, whose history is the sides' and the caps': the profile at
 /// `w0` is the start cap and at `w1` the end cap (the other way round when `from_end`).
 pub(crate) fn cap_and_close(sides: Vec<Side>, w0: &[mt::Wire], w1: &[mt::Wire], from_end: bool) -> Result<Body> {
     let (mut faces, prov): (Vec<mt::Face>, Vec<Option<FaceProv>>) = sides.into_iter().unzip();
     let history: Option<Vec<FaceProv>> = prov.into_iter().chain([Some(record::cap(from_end)), Some(record::cap(!from_end))]).collect();
-    let bottom =
-        builder::try_attach_plane(&w0.iter().map(|w| w.inverse()).collect::<Vec<_>>()).map_err(|e| KernelError::Failed(format!("cap: {e}")))?;
-    let top = builder::try_attach_plane(w1).map_err(|e| KernelError::Failed(format!("cap: {e}")))?;
+    let bottom = cap_plane(&w0.iter().map(|w| w.inverse()).collect::<Vec<_>>())?;
+    let top = cap_plane(w1)?;
     let mut last = String::new();
     for (b, t) in [(bottom.clone(), top.clone()), (bottom.inverse(), top.inverse()), (bottom.clone(), top.inverse()), (bottom.inverse(), top)] {
         let mut all = std::mem::take(&mut faces);
