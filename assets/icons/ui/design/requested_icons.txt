@@ -72,6 +72,7 @@ contact_new	false
 contact_off	false
 contact_sets	false
 continuity	false
+contour	false
 convert_sheet	false
 copy	false
 curvature_comb	false
@@ -169,6 +170,7 @@ plastic_assign	false
 plastic_rule	false
 play	false
 plus	false
+pocket	false
 point	false
 point_along_path	false
 point_center	false
@@ -179,6 +181,7 @@ point_vertex	false
 polygon	false
 polygon_circumscribed	false
 polygon_edge	false
+post	false
 presspull	false
 project	false
 project_surface	false
@@ -209,6 +212,7 @@ section	false
 select	false
 send	false
 settings	false
+setup	false
 sheet_rules	false
 shell	false
 shield	false
@@ -270,6 +274,7 @@ svg	false
 sweep	false
 text	false
 thread	false
+tool	false
 torus	false
 trace	false
 trim	false

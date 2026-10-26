@@ -45,3 +45,10 @@ sketch_chamfer_equal = { master = "sketch_chamfer", accent = "sketch" }
 sketch_chamfer_two = { master = "sketch_chamfer_two_distances", accent = "sketch" }
 offset_one_side = { master = "offset", accent = "sketch" }
 bom = "list"
+
+# CAM (MANUFACTURE) commands draw finished artwork that reads as their operation.
+tool = "thread"           # a fluted cutter
+setup = "bounding_solid"  # the part in its stock
+contour = "offset"        # a path along the outline
+pocket = "hole"           # a recess cleared from a block
+post = "export"           # the NC program written out

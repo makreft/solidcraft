@@ -59,7 +59,7 @@ pub static COMMANDS: &[CommandSpec] = &[
          spindle_off, coolant_on, coolant_off, footer, arcs, arc_tolerance, …} (a post as data, saved with the design and \
          replacing one of the same name) | name + delete: true",
     ),
-    CommandSpec::new("cam.list", "List CAM", list_cmd).icon("tool").noundo().params("→ tools, setups (with operations) and saved posts"),
+    CommandSpec::new("cam.list", "List CAM", list_cmd).icon("list").noundo().params("→ tools, setups (with operations) and saved posts"),
 ];
 
 fn tool_cmd(s: &mut Session, p: &Value) -> Result<Value> {

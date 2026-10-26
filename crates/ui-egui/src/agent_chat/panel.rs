@@ -628,9 +628,9 @@ fn glyph_button(ui: &mut egui::Ui, kind: &str, tip: &str) -> egui::Response {
         }
         // A letter A with a minus or a plus: smaller or bigger text.
         "text_smaller" | "text_bigger" => {
-            let (size, sign) = if kind == "text_bigger" { (15.0, "+") } else { (11.0, "−") };
+            let (size, sign) = if kind == "text_bigger" { (t.font_subtitle, "+") } else { (t.font_small, "−") };
             p.text(c + vec2(-2.5, 1.0), Align2::CENTER_CENTER, "A", egui::FontId::proportional(size), t.text);
-            p.text(c + vec2(5.5, -3.5), Align2::CENTER_CENTER, sign, egui::FontId::proportional(10.0), t.text);
+            p.text(c + vec2(5.5, -3.5), Align2::CENTER_CENTER, sign, egui::FontId::proportional(t.font_micro), t.text);
         }
         _ => {}
     }
