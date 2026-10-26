@@ -15,6 +15,15 @@ Before choosing a task, check the [command inventory](docs/features.md) and
 
 Questions, ideas or want to say what you're working on? Join the [Discord](https://discord.gg/FtU4NQNVDH).
 
+## Kernel work is paused
+
+We're evaluating a new geometry kernel. Until that's decided, please don't open issues, pull
+requests or discussions about kernel work: booleans, fillets, chamfers, shell, offsets, sweeps and
+lofts, threads and holes, STEP/IGES import and export, tessellation, or anything else that changes
+`crates/kernel/`. The pinned issue on the tracker explains it. New ones get the `kernel-paused`
+label (`.github/workflows/kernel-paused.yml`) and a maintainer answers them. Crashes and data loss
+are still taken as issues, and everything outside the kernel carries on as normal.
+
 ## Get it running (about 10 minutes on a fast machine)
 
 You need stable Rust 1.95 or newer (required by egui/eframe 0.36). For the web
@@ -121,7 +130,9 @@ The [architecture page](docs/architecture.md) has the layer table. The short ver
    - Every call into truck goes through `solidcraft_kernel::guard`.
    - Every crash fix comes with a regression test.
 5. **Everything is a command, with a test.** A new feature means a `CommandSpec` in
-   `crates/engine/src/cmd/`, engine tests that measure the result (volume, area,
+   `crates/engine/src/cmd/` with input and output schemas (see
+   [Adding a command](docs/book/src/dev/commands.md#adding-a-command); a test warns about a
+   command without them, and will fail it once required), engine tests that measure the result (volume, area,
    face/edge/vertex counts against a value you can derive), and for UI work a scenario (below).
 6. **One set of camera controls.** Every page or canvas that shows a view (the modelling
    viewport, the Render preview, and any new page such as a flat pattern or drawing) calls
@@ -177,8 +188,14 @@ no LTO, and debug assertions off (truck has debug-only assertions that reject va
 builds several times faster than `--release`. If a test fails only in a plain debug build, say so
 in the PR. `cargo xtask test` builds the tests with it and then runs every test binary at once
 (`cargo test` runs them one after another); arguments after `--` go to each binary, e.g.
-`cargo xtask test -- shell`. Tests run beside each other on a busy machine, so a test must not
-depend on wall-clock timing.
+`cargo xtask test -- shell`. Set `SOLIDCRAFT_TEST_JOBS` to a positive integer to opt into a
+shared bound on top-level test/side commands for `cargo xtask test` and `cargo xtask ci`.
+For example, `SOLIDCRAFT_TEST_JOBS=2` allows two commands at once; the sequential wasm/doc
+worker consumes one of those slots. Every binary and side check still runs after failures.
+Without the variable the existing concurrency is unchanged. `RUST_TEST_THREADS`,
+`ACTION_MATRIX_JOBS` and Cargo's build-job setting remain independent caller overrides;
+this limit does not choose their values or change test filters, timeouts or baselines.
+Tests run beside each other on a busy machine, so a test must not depend on wall-clock timing.
 
 **Ready pull requests test what they touch.** CI maps changed files to workspace packages and
 runs Clippy, the test build and tests for those and their dependents. The
@@ -259,12 +276,18 @@ and a fresh CI run:
   and the Lists workflow) fails on an unsorted catalog or an id that appears twice.
 - **`mod` lines**: one per line, in the sorted group they belong to (`cargo fmt` keeps each group
   sorted). Add a new module into the existing group, not as a new group at the end.
+- **Commands without schemas** (`crates/engine/src/schema/unconverted.txt`): sorted, one id per
+  line, and it only shrinks. Converting a command removes its line; a new command is never added
+  to it.
 - **Languages** (`crates/ui-egui/src/i18n.rs`): one per line, English first, then by id (a test
   checks it).
 - **Generated files**: `THIRD-PARTY-LICENSES.txt` and `docs/features.md` are rewritten on `main`
   after each merge by the Generated files workflow (`cargo xtask licences`, `cargo xtask
   features`). Don't regenerate or edit them in a pull request.
 - **Design format**: one file per change, never an edit to a shared number (above).
+- **New UI strings and attribution rows**: one new file per change, `assets/locales/pending/<slug>.json`
+  and `attribution/pending/<slug>.md`, instead of editing the catalogs or the ATTRIBUTION.md table;
+  `cargo xtask fold-pending` folds them on `main` (see the README in each folder).
 
 ## Sending a change
 
@@ -330,6 +353,10 @@ Much of SolidCraft so far was written by AI coding agents (Claude) working in pa
 owning one area, with a human setting direction and reporting bugs. Their working notes are in
 [AGENTS.md](AGENTS.md). Human contributors are just as welcome. Use whatever tools you like, as
 long as the change meets the rules above.
+
+Two quick checks run on every pull request (`.github/workflows/pr-checks.yml`, not required): it
+fails when a lower-numbered open PR by someone else already closes the same issue (the label
+`not-a-duplicate` skips it), or when the description lacks the `Changes a default: no` / `Changes a default: yes — <what>, old behaviour kept behind preference <name>` line (docs-only and bot PRs are exempt).
 
 ## Labels and triage
 

@@ -34,6 +34,8 @@ pub enum PromptPart {
 pub enum Event {
     /// Whether the agent takes documents (PDFs) in a message; sent before [`Event::Ready`].
     Documents(bool),
+    /// Whether SolidCraft tools were offered by the backend.
+    ToolsAvailable(bool),
     /// Ready for a message. `agent`: its name and version; `images`: it takes pictures.
     Ready { agent: String, images: bool },
     /// Text it streams (`thought`: its reasoning, shown dimmed).
@@ -100,6 +102,8 @@ pub trait ChatBackend {
     fn set_model(&mut self, _model: &str) {}
     /// Switch to one of the modes it reported in [`Event::Modes`].
     fn set_mode(&mut self, _mode: &str) {}
+    /// An endpoint's new request timeout, in seconds, from the next request on.
+    fn set_request_timeout(&mut self, _secs: u64) {}
     /// Its process, for status and tests.
     fn pid(&self) -> Option<u32> {
         None

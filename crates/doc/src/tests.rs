@@ -251,6 +251,45 @@ fn params_and_serialization() {
     assert!(doc.param("d1").is_none(), "unused model parameters are pruned");
 }
 
+/// #4783: a body reads the material its mass is computed with, as the library or the design
+/// spells it. An unknown name, or a design material with an unusable density, reads as the
+/// default material it weighs. `density` agrees in every case, and a configuration keeps the
+/// assignment as stored.
+#[test]
+fn a_body_reads_the_material_its_mass_is_computed_with() {
+    let mut doc = Document::new("materials");
+    let usable = [("Walnut", 0.65), ("Mote", f64::MIN_POSITIVE), ("Limit", MAX_DENSITY)];
+    let unusable = [("Broken", -3.0), ("Weightless", 0.0), ("Beyond", MAX_DENSITY.next_up())];
+    for (name, density) in usable.into_iter().chain(unusable) {
+        doc.user_materials.push(UserMaterial { name: name.into(), density, appearance: None, physical_card: None });
+    }
+    // (body, its assignment as stored, the material it reads and weighs, that material's density)
+    let cases = [
+        ("Known", Some("Steel"), "Steel", 7.85),
+        ("Miscased", Some("steel"), "Steel", 7.85),
+        ("Own", Some(" walnut "), "Walnut", 0.65),
+        ("Lightest", Some("Mote"), "Mote", f64::MIN_POSITIVE),
+        ("At the limit", Some("Limit"), "Limit", MAX_DENSITY),
+        ("Unknown", Some("Unobtainium"), DEFAULT_MATERIAL, DEFAULT_DENSITY),
+        ("Unusable", Some("Broken"), DEFAULT_MATERIAL, DEFAULT_DENSITY),
+        ("Zero density", Some("Weightless"), DEFAULT_MATERIAL, DEFAULT_DENSITY),
+        ("Over the limit", Some("Beyond"), DEFAULT_MATERIAL, DEFAULT_DENSITY),
+        ("Unassigned", None, DEFAULT_MATERIAL, DEFAULT_DENSITY),
+    ];
+    for (body, stored, ..) in cases {
+        if let Some(material) = stored {
+            doc.materials.insert(body.into(), material.into());
+        }
+    }
+    for (body, stored, material, density) in cases {
+        assert_eq!(doc.body_material(body), material, "{body}");
+        assert_eq!(doc.density(body), density, "{body}");
+        assert_eq!(doc.material_density(material), Some(density), "{body}: the density is its material's");
+        let cell = doc.config_current(&crate::config::Column::Material(body.into()));
+        assert_eq!(cell.as_deref(), Some(stored.unwrap_or(DEFAULT_MATERIAL)), "{body}: a configuration keeps the assignment as stored");
+    }
+}
+
 #[test]
 fn primitives_and_combine() {
     let mut doc = Document::new("p");
@@ -429,4 +468,77 @@ fn self_referencing_construction_planes_are_errors() {
     let mut m = Model::new();
     m.evaluate(&doc);
     assert!(m.results.iter().any(|r| r.error.is_some()), "a cyclic perpendicular plane must report an error: {:?}", m.results);
+}
+
+/// New names take the first free number after their stem, whatever else is named alike: a gap
+/// is filled, and `Sketch07`, `Sketch+2` or `SketchLid` take no number (they are not `Sketch7`).
+#[test]
+fn new_names_take_the_first_free_number() {
+    let taken = crate::params::numbers_after("Box", ["Box1", "Box3", "Box07", "Box+2", "BoxLid", "Box", "Cylinder2"].into_iter());
+    assert_eq!(taken, std::collections::HashSet::from([1, 3]));
+    let mut doc = Document::new("names");
+    let sketch = |doc: &mut Document| {
+        doc.add_feature(FeatureKind::Sketch { plane: PlaneRef::Origin { name: "XY".into() }, sketch: Sketch::new() }, None).unwrap()
+    };
+    let name = |doc: &Document, id: u64| doc.feature(id).map(|f| f.name.clone()).unwrap_or_default();
+    let ids: Vec<u64> = (0..3).map(|_| sketch(&mut doc)).collect();
+    let names: Vec<String> = ids.iter().map(|id| name(&doc, *id)).collect();
+    assert!(names.iter().all(|n| n.starts_with("Sketch")) && names[0] != names[1] && names[1] != names[2], "{names:?}");
+    for (id, other) in [(ids[0], "SketchLid"), (ids[1], "Sketch07")] {
+        if let Some(f) = doc.feature_mut(id) {
+            f.name = other.into();
+        }
+    }
+    let next = sketch(&mut doc);
+    assert_eq!(name(&doc, next), names[0], "the first freed number is taken again");
+}
+
+#[test]
+fn empty_boolean_targets_name_overlapping_component() {
+    for (operation, offset) in [(Operation::Cut, 0.0), (Operation::Intersect, 0.0), (Operation::Cut, 40.0)] {
+        let (mut doc, sketch) = plate_doc();
+        let imported = doc.add_component(Some("Imported STEP"), 0).unwrap();
+        let part = doc.add_component(Some("Part1"), 0).unwrap();
+        doc.features.last_mut().unwrap().component = imported;
+        doc.feature_mut(sketch).unwrap().component = imported;
+        doc.occurrences.iter_mut().find(|o| o.component == imported).unwrap().transform[2][3] = offset;
+        let mut kind = doc.features.last().unwrap().kind.clone();
+        if let FeatureKind::Extrude { operation: op, .. } = &mut kind {
+            *op = operation;
+        }
+        let cut = doc.add_feature(kind, None).unwrap();
+        doc.feature_mut(cut).unwrap().component = part;
+        let mut model = Model::new();
+        model.evaluate(&doc);
+        let error = model.result(cut).unwrap().error.as_deref().unwrap();
+        assert!(error.contains("component 'Part1'"), "offset {offset}: {error}");
+        assert!(error.contains("'Body1' in component 'Imported STEP'"), "offset {offset}: {error}");
+        assert!(error.contains("activate that component or pick the body as a target"), "offset {offset}: {error}");
+        assert_eq!(model.state().bodies.len(), 1);
+        assert!(rel(measure(&model.state().bodies[0].body).unwrap().volume, 24000.0) < 1e-9);
+    }
+}
+
+#[test]
+fn empty_boolean_targets_without_overlap_keep_plain_message() {
+    for operation in [Operation::Cut, Operation::Intersect] {
+        let (mut doc, _) = plate_doc();
+        let part = doc.add_component(Some("Part1"), 0).unwrap();
+        let cut = doc
+            .add_feature(
+                FeatureKind::Box {
+                    corner: point_expr(Vec3::new(100.0, 100.0, 100.0)),
+                    length: "1".into(),
+                    width: "1".into(),
+                    height: "1".into(),
+                    operation,
+                },
+                None,
+            )
+            .unwrap();
+        doc.feature_mut(cut).unwrap().component = part;
+        let mut model = Model::new();
+        model.evaluate(&doc);
+        assert_eq!(model.result(cut).unwrap().error.as_deref(), Some("there is no body to cut or intersect"));
+    }
 }

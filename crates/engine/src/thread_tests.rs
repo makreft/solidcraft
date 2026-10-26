@@ -4,6 +4,7 @@
 use std::f64::consts::PI;
 
 use serde_json::{Value, json};
+use solidcraft_geom::Vec3;
 
 use crate::Session;
 
@@ -22,6 +23,132 @@ fn volume(s: &mut Session, b: &str) -> f64 {
 }
 
 const SIZES: [(f64, f64); 9] = [(3.0, 0.5), (4.0, 0.7), (5.0, 0.8), (6.0, 1.0), (8.0, 1.25), (10.0, 1.5), (12.0, 1.75), (16.0, 2.0), (20.0, 2.5)];
+
+fn assert_tapped_depth(state: &solidcraft_doc::ModelState, entry: Vec3, inward: Vec3, offset: f64, depth: f64) {
+    assert_eq!(state.threads.len(), 1);
+    let thread = &state.threads[0];
+    assert!(thread.internal);
+    let a = (thread.axis_point + thread.axis * thread.start - entry).dot(inward);
+    let b = (thread.axis_point + thread.axis * thread.end - entry).dot(inward);
+    assert!((a.min(b) - offset).abs() < 1e-6, "thread entry {} mm, expected {offset} mm", a.min(b));
+    assert!((a.max(b) - offset - depth).abs() < 1e-6, "thread end {} mm, expected {} mm", a.max(b), offset + depth);
+}
+
+#[test]
+fn tapped_thread_depth_keeps_reference_edge_placement_after_reopen() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length":60,"width":60,"height":12}));
+    run(
+        &mut s,
+        "solid.hole",
+        json!({"position":[30,30,12],"thread":"M6","depth":8,"thread_depth":3,
+            "references":[{"edge":[0,25,12],"distance":"10 mm"},{"edge":[25,0,12],"distance":"12 mm"}]}),
+    );
+    let inward = Vec3::new(0.0, 0.0, -1.0);
+    let entry = Vec3::new(10.0, 12.0, 12.0);
+    assert_tapped_depth(&s.model.state(), entry, inward, 0.0, 3.0);
+    let reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    assert_tapped_depth(&reopened.model.state(), entry, inward, 0.0, 3.0);
+    let solidcraft_doc::FeatureKind::Hole { references, thread_depth, .. } = &reopened.doc.features.last().unwrap().kind else {
+        panic!("expected a referenced tapped hole");
+    };
+    assert_eq!(references.len(), 2);
+    assert_eq!(thread_depth.as_ref().unwrap().to_string(), "3");
+    assert!(!reopened.model.state().bodies[0].body.contains(Vec3::new(10.0, 12.0, 10.0)));
+}
+
+#[test]
+fn tapped_thread_depth_is_independent_through_preview_redefine_undo_and_reload() {
+    for (height, mut params, full) in
+        [(12.0, json!({"depth":8,"type":"drilled"}), 8.0), (12.0, json!({}), 12.0), (12.0, json!({"to":[30,30,5]}), 7.0)]
+    {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length":60,"width":60,"height":height,"body_name":"Plate"}));
+        params["position"] = json!([30, 30, height]);
+        params["direction"] = json!([0, 0, -1]);
+        params["thread"] = json!("M6");
+        let hole = run(&mut s, "solid.hole", params.clone())["feature"].as_u64().unwrap();
+        let entry = Vec3::new(30.0, 30.0, height);
+        let inward = Vec3::new(0.0, 0.0, -1.0);
+        assert_tapped_depth(&s.model.state(), entry, inward, 0.0, full);
+        let before = s.doc.to_json();
+        let physical_volume = volume(&mut s, "Plate");
+
+        // Version 29 never saved this field: its default remains the full wall.
+        let mut legacy: Value = serde_json::from_str(&before).unwrap();
+        legacy["format"] = json!("solidcraft/29");
+        let reopened = Session::new(solidcraft_doc::Document::from_json(&legacy.to_string()).unwrap());
+        assert_tapped_depth(&reopened.model.state(), entry, inward, 0.0, full);
+
+        params["thread_depth"] = json!(4);
+        let redefine = json!({"feature":hole,"command":"solid.hole","params":params});
+        let preview = s.preview(&[("timeline.redefine".into(), redefine.clone())]).unwrap();
+        assert_tapped_depth(&preview.after, entry, inward, 0.0, 4.0);
+        assert_eq!(s.doc.to_json(), before, "preview must not change the design");
+        run(&mut s, "timeline.redefine", redefine);
+        assert_tapped_depth(&s.model.state(), entry, inward, 0.0, 4.0);
+        assert!((volume(&mut s, "Plate") - physical_volume).abs() < 1e-6, "thread depth must not change the drill geometry");
+        let saved = s.doc.to_json();
+        let reopened = Session::new(solidcraft_doc::Document::from_json(&saved).unwrap());
+        assert_tapped_depth(&reopened.model.state(), entry, inward, 0.0, 4.0);
+        run(&mut s, "edit.undo", json!({}));
+        assert_eq!(s.doc.to_json(), before);
+        assert_tapped_depth(&s.model.state(), entry, inward, 0.0, full);
+    }
+}
+
+#[test]
+fn tapped_thread_depth_uses_the_cylinder_beyond_recesses_and_in_shallow_holes() {
+    for (height, mut params, offset, full) in [
+        (12.0, json!({"thread":"M6","type":"counterbore","cb_diameter":12,"cb_depth":5,"depth":9}), 5.0, 4.0),
+        (12.0, json!({"thread":"G 1/4","type":"counterbore","cb_diameter":20,"cb_depth":5,"depth":9}), 5.0, 4.0),
+        (12.0, json!({"thread":"1/4-20 UNC","type":"counterbore","cb_diameter":12,"cb_depth":5,"depth":9}), 5.0, 4.0),
+        (12.0, json!({"thread":"M6","type":"countersink","cs_diameter":11,"cs_angle":"90 deg","depth":9}), 3.0, 6.0),
+        (12.0, json!({"thread":"M36","type":"drilled","depth":3}), 0.0, 3.0),
+        (5.0, json!({"thread":"M36"}), 0.0, 5.0),
+    ] {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length":60,"width":60,"height":height,"body_name":"Plate"}));
+        params["position"] = json!([30, 30, height]);
+        params["direction"] = json!([0, 0, -1]);
+        let hole = run(&mut s, "solid.hole", params.clone())["feature"].as_u64().unwrap();
+        let entry = Vec3::new(30.0, 30.0, height);
+        let inward = Vec3::new(0.0, 0.0, -1.0);
+        assert_tapped_depth(&s.model.state(), entry, inward, offset, full);
+        params["thread_depth"] = json!(2);
+        run(&mut s, "timeline.redefine", json!({"feature":hole,"command":"solid.hole","params":params}));
+        assert_tapped_depth(&s.model.state(), entry, inward, offset, 2.0);
+    }
+}
+
+#[test]
+fn tapped_thread_depth_starts_at_the_entry_for_both_axis_directions() {
+    for (entry, inward) in [(Vec3::new(0.0, 10.0, 6.0), Vec3::new(1.0, 0.0, 0.0)), (Vec3::new(20.0, 10.0, 6.0), Vec3::new(-1.0, 0.0, 0.0))] {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length":20,"width":20,"height":12}));
+        run(
+            &mut s,
+            "solid.hole",
+            json!({"position":[entry.x,entry.y,entry.z],"direction":[inward.x,inward.y,inward.z],"thread":"M6","depth":8,"thread_depth":3}),
+        );
+        assert_tapped_depth(&s.model.state(), entry, inward, 0.0, 3.0);
+    }
+}
+
+#[test]
+fn tapped_thread_depth_rejects_invalid_or_excessive_values_atomically() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length":20,"width":20,"height":10}));
+    let before = s.doc.to_json();
+    for depth in [json!(0), json!(-1), json!(20), json!(true), json!(""), json!("NaN mm"), json!("1e999 mm"), json!("3 deg")] {
+        let result = s.execute("solid.hole", &json!({"position":[10,10,10],"thread":"M6","depth":8,"thread_depth":depth}));
+        assert!(result.is_err(), "invalid thread depth {depth}: {result:?}");
+        assert_eq!(s.doc.to_json(), before);
+        assert!(s.model.state().threads.is_empty());
+    }
+    assert!(s.execute("solid.hole", &json!({"position":[10,10,10],"diameter":5,"thread_depth":3})).is_err());
+    assert_eq!(s.doc.to_json(), before);
+}
 
 /// Keep the original 48-station reproduction of the shell error even though new fine
 /// threads now use more stations. The same cut polygons must rebuild as a closed solid.
@@ -90,6 +217,128 @@ fn modelled_full_length_fine_threads_on_large_shafts() {
         let got = before - volume(&mut s, "Shaft");
         assert!((got - want).abs() < want * 0.04, "M{d}x{p}: removed {got}, ISO profile {want}");
     }
+}
+
+/// A modelled thread on a shaft thicker than it turns the shaft down to the major diameter
+/// over the threaded length, then cuts the thread: an M6 over the top 8 mm of an 8 mm shaft
+/// leaves a 6 mm threaded section on an 8 mm stub, its turned face named for later features.
+/// A shaft of the thread's own size is cut as it is.
+#[test]
+fn a_shaft_thicker_than_a_modelled_thread_is_turned_down_to_it() {
+    let (p, len) = (1.0, 8.0);
+    let root = 3.0 - 5.0 * p * 3f64.sqrt() / 16.0;
+    let groove = per_turn(root, 3.0, |r| p / 4.0 + 2.0 * (r - root) * (PI / 6.0).tan()) * len / p;
+    for (shaft, turned) in [(8.0, true), (6.0, false)] {
+        let mut s = Session::default();
+        run(&mut s, "solid.cylinder", json!({"radius": shaft / 2.0, "height": 12, "body_name": "Shaft"}));
+        run(&mut s, "solid.thread", json!({"face": [shaft / 2.0, 0, 11], "designation": "M6", "length": len, "modeled": true}));
+        let ring = PI * (shaft * shaft / 4.0 - 9.0) * len;
+        let want = PI * shaft * shaft / 4.0 * 12.0 - ring - groove;
+        let got = volume(&mut s, "Shaft");
+        assert!((got - want).abs() < groove * 0.03, "M6 on {shaft} mm: {got} mm³, want {want}");
+        let st = s.model.state();
+        let Some(b) = st.body("Shaft") else { panic!("no shaft") };
+        assert!(b.body.validity().is_empty(), "{shaft} mm: {:?}", b.body.validity());
+        // Nothing past the major diameter over the threaded length; the stub keeps its size.
+        let round = |z: f64, r: f64| {
+            (0..24).filter(|i| b.body.contains(Vec3::new(r * (PI * *i as f64 / 12.0).cos(), r * (PI * *i as f64 / 12.0).sin(), z))).count()
+        };
+        assert_eq!(round(8.0, 3.05), 0, "{shaft} mm: the threaded part is turned to 6 mm");
+        assert_eq!(round(2.0, shaft / 2.0 - 0.05), 24, "{shaft} mm: the stub is whole");
+        let names = solidcraft_doc::naming::face_names(b);
+        let fid = s.doc.features.last().map(|f| f.id).unwrap_or(0);
+        let named = |role: &str| names.iter().any(|n| n.starts_with(&format!("F{fid}:{role}")));
+        assert_eq!(named("turned"), turned, "{shaft} mm: {names:?}");
+        assert_eq!(named("shoulder:"), turned, "{shaft} mm: {names:?}");
+    }
+
+    // A 9 mm shaft is close enough to M8 to be offered it; it was refused as too thick (#2688).
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 4.5, "height": 10, "body_name": "Shaft"}));
+    run(&mut s, "solid.thread", json!({"face": [4.5, 0, 5], "designation": "M8", "modeled": true}));
+    let root = 4.0 - 5.0 * 1.25 * 3f64.sqrt() / 16.0;
+    let groove = per_turn(root, 4.0, |r| 1.25 / 4.0 + 2.0 * (r - root) * (PI / 6.0).tan()) * 10.0 / 1.25;
+    let (want, got) = (PI * 16.0 * 10.0 - groove, volume(&mut s, "Shaft"));
+    assert!((got - want).abs() < groove * 0.03, "M8 on 9 mm: {got} mm³, want {want}");
+}
+
+/// Issue 2705: an M14 over the top 10 mm of a 14.6 mm boss on a plate. Turned to 14 mm first:
+/// 1600 + π 7.3² 15 − π (7.3² − 7²) 10 − 5 turns of 50.189 mm³ (tests/kernel-cases/threads/2705).
+#[test]
+fn an_m14_thread_on_a_14_6_mm_boss_turns_it_to_14_mm() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"corner": [-10, -10, 0], "length": 20, "width": 20, "height": 4, "body_name": "Part"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 7.3, "height": 15, "base": [0, 0, 4], "operation": "join", "targets": ["Part"]}));
+    run(&mut s, "solid.thread", json!({"face": [7.3, 0, 17], "designation": "M14", "length": 10, "modeled": true}));
+    let got = volume(&mut s, "Part");
+    assert!((got - 3725.5127).abs() < 3725.5127 * 0.01, "{got} mm³");
+}
+
+/// A shaft thinner than the thread's minor diameter is still refused, and so is a cosmetic
+/// thread on a shaft thicker than it (a note changes nothing to turn). A shaft the part goes on
+/// round (standing against a wall) is not turned into the wall.
+#[test]
+fn a_thin_shaft_or_one_the_part_surrounds_is_refused() {
+    let refused = |s: &mut Session, body: &str, p: Value| {
+        let before = volume(s, body);
+        let e = s.execute("solid.thread", &p).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!((volume(s, body) - before).abs() < 1e-9, "{p}: {e}");
+        e
+    };
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 2.4, "height": 10, "body_name": "Shaft"}));
+    let e = refused(&mut s, "Shaft", json!({"face": [2.4, 0, 5], "designation": "M6", "modeled": true}));
+    assert!(e.contains("does not fit a 4.80 mm shaft") || e.contains("too thin"), "{e}");
+
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 4, "height": 10, "body_name": "Shaft"}));
+    let e = refused(&mut s, "Shaft", json!({"face": [4, 0, 5], "designation": "M6"}));
+    assert!(e.contains("an M6 thread does not fit a 8.00 mm shaft"), "{e}");
+
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"corner": [2, -10, 0], "length": 10, "width": 20, "height": 10, "body_name": "Part"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 4, "height": 10, "operation": "join", "targets": ["Part"]}));
+    let e = refused(&mut s, "Part", json!({"face": [-4, 0, 5], "designation": "M6", "modeled": true}));
+    assert!(e.contains("this 8 mm shaft is too thick for a modelled M6 thread") && e.contains("part around it"), "{e}");
+}
+
+#[test]
+fn a_thread_without_a_coarse_pitch_suggests_explicit_pitches() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 14, "height": 10, "body_name": "Shaft"}));
+    let saved = s.doc.to_json();
+    for designation in ["M28", "m28", " M28 "] {
+        let e = s.execute("solid.thread", &json!({"face": [14, 0, 5], "designation": designation})).unwrap_err().to_string();
+        assert!(e.contains("has no coarse ISO pitch") && e.contains("M28x2") && e.contains("M28x1.5"), "{e}");
+        assert_eq!(s.doc.to_json(), saved);
+    }
+    for designation in ["MNaN", "Minf", "M-28", "M0", "M1e9", "M1e999", "M28x", "M28xNaN"] {
+        let e = s.execute("solid.thread", &json!({"face": [14, 0, 5], "designation": designation})).unwrap_err().to_string();
+        assert!(e.contains("unknown thread"), "{designation}: {e}");
+        assert_eq!(s.doc.to_json(), saved);
+    }
+    run(&mut s, "solid.thread", json!({"face": [14, 0, 5], "designation": "M28x2"}));
+}
+
+#[test]
+fn automatic_sizing_past_the_coarse_range_suggests_a_size_with_its_pitch() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 37.5, "height": 10, "body_name": "Shaft"}));
+    let saved = s.doc.to_json();
+    let e = s.execute("solid.thread", &json!({"face": [37.5, 0, 5]})).unwrap_err().to_string();
+    assert!(e.contains("beyond the coarse thread range (up to M56)") && e.contains("M75x3 or M75x2"), "{e}");
+    assert_eq!(s.doc.to_json(), saved);
+    run(&mut s, "solid.thread", json!({"face": [37.5, 0, 5], "designation": "M75x2"}));
+}
+
+#[test]
+fn a_threaded_hole_without_a_coarse_pitch_suggests_explicit_pitches() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 10}));
+    let saved = s.doc.to_json();
+    let e = s.execute("solid.hole", &json!({"position": [20, 20, 10], "thread": "M28"})).unwrap_err().to_string();
+    assert!(e.contains("has no coarse ISO pitch") && e.contains("M28x2") && e.contains("M28x1.5"), "{e}");
+    assert_eq!(s.doc.to_json(), saved);
 }
 
 #[test]
@@ -174,9 +423,9 @@ fn a_modelled_thread_that_would_cut_nothing_is_refused() {
 
 /// Issue 2688: an M8 modelled thread in a 6 mm hole (narrower than its 6.65 mm minor diameter)
 /// was refused as "the face is too far from the thread's diameter". It says what is wrong and
-/// what to drill, as a hole that is too wide does; and the same for a shaft that is too thick.
+/// what to drill, as a hole that is too wide does. (A shaft too thick is turned down.)
 #[test]
-fn a_hole_too_narrow_or_a_shaft_too_thick_says_which_and_what_fits() {
+fn a_hole_too_narrow_says_so_and_what_fits() {
     let mut s = hex_nut(6.0);
     let before = volume(&mut s, "Nut");
     let e = s.execute("solid.thread", &json!({"face": [3.0, 0, 2], "designation": "M8", "modeled": true})).err().map(|e| e.to_string());
@@ -184,13 +433,6 @@ fn a_hole_too_narrow_or_a_shaft_too_thick_says_which_and_what_fits() {
     assert!(e.contains("this 6 mm hole is too narrow for a modelled M8 thread") && e.contains("drill 6.75 mm for M8"), "{e}");
     assert!(!e.contains("too far"), "{e}");
     assert!((volume(&mut s, "Nut") - before).abs() < 1e-9);
-
-    let mut s = Session::default();
-    // 9 mm is close enough to M8 to be offered it, too thick to cut it.
-    run(&mut s, "solid.cylinder", json!({"radius": 4.5, "height": 10, "body_name": "Shaft"}));
-    let e = s.execute("solid.thread", &json!({"face": [4.5, 0, 5], "designation": "M8", "modeled": true})).err().map(|e| e.to_string());
-    let e = e.unwrap_or_default();
-    assert!(e.contains("this 9 mm shaft is too thick for a modelled M8 thread") && e.contains("make the shaft 8 mm for M8"), "{e}");
 }
 
 /// The limit is a quarter of the basic depth 5H/8: a hole up to 4.78 mm for M5 (4.86 mm for

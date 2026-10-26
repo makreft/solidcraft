@@ -677,3 +677,63 @@ fn a_face_sketch_saved_with_fitted_letters_reopens_and_builds_the_same() {
         sketch.curves.iter().filter(|c| c.link.is_some() && matches!(c.kind, solidcraft_sketch::CurveKind::Spline { control: true, .. })).count();
     assert!(pieces > 0, "{pieces}");
 }
+
+#[test]
+fn a_face_seen_edge_on_projects_as_its_silhouette_and_follows_edits() {
+    let mut s = Session::default();
+    box_part(&mut s);
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 30}));
+    // The +x wall of the 40 x 30 x 20 box, seen from above: one line from (40, 0) to (40, 30).
+    let r = run(&mut s, "sketch.project", json!({"refs": [{"face": [40, 15, 10]}]}));
+    let link = r["links"][0]["link"].as_str().unwrap().to_string();
+    assert_eq!(ids(&r["links"][0]["curves"]).len(), 1, "{r}");
+    let si = inspect(&mut s);
+    let c = linked_curves(&si).into_iter().find(|c| c["link"] == link.as_str()).unwrap();
+    let xs: Vec<f64> = [&c["start_at"][0], &c["end_at"][0]].iter().map(|v| v.as_f64().unwrap()).collect();
+    assert!(xs.iter().all(|x| (x - 40.0).abs() < 1e-6), "{c}");
+    run(&mut s, "sketch.finish", json!({}));
+    let sketch = s.doc.features.last().unwrap().id;
+    let lost = |s: &Session| s.model.state().sketch(sketch).unwrap().sketch.link(&link).unwrap().lost;
+    assert!(!lost(&s), "the silhouette is current after the sketch is evaluated");
+    assert!(
+        s.model.results.iter().all(|r| r.warning.is_none()),
+        "{:?}",
+        s.model.results.iter().filter_map(|r| r.warning.clone()).collect::<Vec<_>>()
+    );
+    // The wall follows the width.
+    run(&mut s, "parameters.change", json!({"name": "width", "expression": "50 mm"}));
+    assert!(!lost(&s), "{:?}", s.model.results.iter().filter_map(|r| r.warning.clone()).collect::<Vec<_>>());
+    let st = s.model.state();
+    let sk = &st.sketch(sketch).unwrap().sketch;
+    let ci = sk.link_curves(&link)[0];
+    let solidcraft_sketch::CurveKind::Line { a, b } = sk.curves[ci].kind else { panic!("not a line") };
+    assert!((sk.point(a).unwrap().x - 50.0).abs() < 1e-6 && (sk.point(b).unwrap().x - 50.0).abs() < 1e-6);
+}
+
+/// A sketch put on a face already shows the face's border. Projecting that face, or one of the
+/// border's edges, again laid a second copy over it (extra points and lines on a rounded
+/// corner); those are skipped now, and a pick of nothing new is refused, so it adds no step.
+#[test]
+fn projecting_what_the_face_sketch_already_shows_adds_no_second_copy() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length":40,"width":30,"height":10}));
+    run(&mut s, "solid.fillet", json!({"edges":[[0,0,5],[40,0,5],[40,30,5],[0,30,5]],"radius":5}));
+    run(&mut s, "sketch.create", json!({"plane":{"face":[20,15,10]}}));
+    let shown = |s: &mut Session| {
+        let si = inspect(s);
+        (si["curves"].as_array().unwrap().len(), si["points"].as_array().unwrap().len())
+    };
+    let border = shown(&mut s);
+    assert_eq!(border.0, 8, "four sides and four rounded corners");
+    let corner = 5.0 - 5.0 * std::f64::consts::FRAC_1_SQRT_2;
+    for refs in [json!([{"face":[20,15,10]}]), json!([{"edge":[20,0,10]}]), json!([{"edge":[corner,corner,10]}])] {
+        let e = s.execute("sketch.project", &json!({"refs": refs})).unwrap_err().to_string();
+        assert!(e.contains("already projected"), "{refs}: {e}");
+        assert_eq!(shown(&mut s), border, "{refs}");
+    }
+    // Something new still projects, and alongside it a reference already shown is skipped.
+    let r = run(&mut s, "sketch.project", json!({"refs":[{"edge":[20,0,10]},{"axis":"X"}]}));
+    assert_eq!(r["links"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["already_projected"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(shown(&mut s).0, border.0 + 1);
+}

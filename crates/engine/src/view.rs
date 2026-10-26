@@ -30,6 +30,8 @@ pub mod colors {
     pub const PROFILE: Rgb = Rgb(255, 196, 120);
     pub const GRID: Rgb = Rgb(196, 202, 212);
     pub const GRID_MAJOR: Rgb = Rgb(170, 178, 190);
+    /// The origin axes: the light theme's X, Y and Z, the one set every axis in the UI is drawn
+    /// with (#976).
     pub const AXIS_X: Rgb = Rgb(220, 60, 60);
     pub const AXIS_Y: Rgb = Rgb(60, 170, 60);
     pub const AXIS_Z: Rgb = Rgb(60, 100, 230);
@@ -105,28 +107,23 @@ impl Default for Palette {
 /// joints and moves place them, and the sketches the view draws (not ones used by a feature,
 /// hidden ones, or ones in hidden components). What Home, Fit and the orbit pivot frame.
 pub fn bounds(s: &Session) -> Aabb3 {
-    visible_bounds(s, true)
+    bounds_by(s, |body| body.mesh_bounds())
 }
 
-/// [`bounds`], with the browser's Sketches folder shown (`sketches`) or hidden.
-pub fn visible_bounds(s: &Session, sketches: bool) -> Aabb3 {
-    bounds_by(s, sketches, |body| body.mesh().bounds())
-}
-
-/// [`visible_bounds`] without meshing anything: a body not meshed yet counts with its outline
+/// [`bounds`] without meshing anything: a body not meshed yet counts with its outline
 /// ([`solidcraft_kernel::Body::outline_bounds`]), which a face curving out past all of its edges
 /// can exceed. Frames a design whose bodies are still being meshed.
-pub fn unmeshed_bounds(s: &Session, sketches: bool) -> Aabb3 {
-    bounds_by(s, sketches, |body| body.cached_mesh().map(|m| m.bounds()).unwrap_or_else(|| body.outline_bounds()))
+pub fn unmeshed_bounds(s: &Session) -> Aabb3 {
+    bounds_by(s, |body| body.cached_mesh().map(|m| m.bounds()).unwrap_or_else(|| body.outline_bounds()))
 }
 
-fn bounds_by(s: &Session, sketches: bool, of: impl Fn(&solidcraft_doc::ModelBody) -> Aabb3) -> Aabb3 {
+fn bounds_by(s: &Session, of: impl Fn(&solidcraft_doc::ModelBody) -> Aabb3) -> Aabb3 {
     let st = s.world_state();
     let mut b = Aabb3::EMPTY;
     for body in st.bodies.iter().filter(|x| s.body_visible(&x.name)) {
         b = b.union(&of(body));
     }
-    for ss in st.sketches.iter().filter(|x| sketch_drawn(s, x.feature, sketches)) {
+    for ss in st.sketches.iter().filter(|x| sketch_shown(s, x.feature)) {
         // All four corners: on a tilted plane two opposite ones don't span the rectangle.
         if let Some((lo, hi)) = ss.sketch.bounds() {
             for p in [lo, hi, solidcraft_geom::Vec2::new(lo.x, hi.y), solidcraft_geom::Vec2::new(hi.x, lo.y)] {
@@ -351,6 +348,12 @@ pub fn sketch_point_visible(sk: &Sketch, i: usize) -> bool {
     sk.points.get(i).is_some_and(|p| SketchPointVisibility::new(sk).takes(p))
 }
 
+/// Stable identification colour shared by every body of a component.
+pub fn component_color(s: &Session, component: u64) -> Option<[u8; 3]> {
+    s.colored_components?;
+    Some(s.doc.component_identification_color(component))
+}
+
 /// The scene for a headless render, cut by the session's section.
 pub fn scene(s: &Session, cam: &Camera) -> Scene {
     scene_with_section(s, cam, s.section)
@@ -424,7 +427,7 @@ pub fn scene_with_palette(
     sampler: impl FnMut(&Sketch, usize, &Plane) -> Vec<Vec<Vec3>>,
     p: &Palette,
 ) -> Scene {
-    build_scene(s, cam, section, Guides::default(), sampler, p)
+    build_scene(s, cam, section, Guides::default(), sampler, p, false)
 }
 
 /// [`scene_with_palette`] with the ground grid and the origin's axes shown or left out.
@@ -436,7 +439,21 @@ pub fn scene_with_palette_and_guides(
     p: &Palette,
     guides: Guides,
 ) -> Scene {
-    build_scene(s, cam, section, guides, sampler, p)
+    build_scene(s, cam, section, guides, sampler, p, false)
+}
+
+/// A picture of the view with cosmetic thread markings explicitly enabled or disabled.
+/// The ordinary scene helpers leave these optional markings off.
+pub fn scene_with_thread_markings(
+    s: &Session,
+    cam: &Camera,
+    section: Option<(Vec3, Vec3)>,
+    sampler: impl FnMut(&Sketch, usize, &Plane) -> Vec<Vec<Vec3>>,
+    p: &Palette,
+    guides: Guides,
+    cosmetic_threads: bool,
+) -> Scene {
+    build_scene(s, cam, section, guides, sampler, p, cosmetic_threads)
 }
 
 fn build_scene(
@@ -446,6 +463,7 @@ fn build_scene(
     guides: Guides,
     mut sampler: impl FnMut(&Sketch, usize, &Plane) -> Vec<Vec<Vec3>>,
     p: &Palette,
+    cosmetic_threads: bool,
 ) -> Scene {
     let st = s.world_state();
     let section = section.filter(|(o, n)| o.is_finite() && n.is_finite() && n.len() > 1e-9);
@@ -453,6 +471,7 @@ fn build_scene(
         background: Some(p.background),
         clip: section.map(|(o, n)| (n, n.dot(o))),
         cap: Some(p.cap),
+        plain_cap: !s.section_hatch,
         analysis: s.analysis.map(|a| SceneAnalysis { mode: a.mode(), colors: p.analysis }),
         ..Default::default()
     };
@@ -500,14 +519,21 @@ fn build_scene(
         })
         .flatten()
         .collect();
+    let mut thread_budget = crate::cosmetic_threads::Budget::default();
     for body in st.bodies.iter().filter(|b| s.body_visible(&b.name)) {
         let selected = selected_occurrences.contains(&body.name) || s.selection.iter().any(|x| matches!(x, Sel::Body { name } if *name == body.name));
         let mesh = body.mesh();
         // The body's appearance (or imported colour) and faces with looks of their own, as in
         // the viewport.
         let to8 = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let color = if selected { p.body_selected } else { s.doc.body_color(body).map_or(p.body, |[r, g, b]| Rgb(to8(r), to8(g), to8(b))) };
-        let face_colors = if selected {
+        let color = if selected {
+            p.body_selected
+        } else if let Some([r, g, b]) = component_color(s, body.component) {
+            Rgb(r, g, b)
+        } else {
+            s.doc.body_color(body).map_or(p.body, |[r, g, b]| Rgb(to8(r), to8(g), to8(b)))
+        };
+        let face_colors = if selected || s.colored_components.is_some() {
             Vec::new()
         } else {
             s.doc.face_colors(body).into_iter().map(|(f, l)| (f as u32, Rgb(l.color[0], l.color[1], l.color[2]))).collect()
@@ -516,6 +542,15 @@ fn build_scene(
         // body is drawn solid, so the selection colour reads.
         let opacity = if selected { 1.0 } else { s.doc.model_body_opacity(body) as f32 };
         sc.meshes.push(SceneMesh { mesh: Arc::clone(&mesh), color, face_colors, opacity });
+        if cosmetic_threads
+            && thread_budget.available()
+            && s.doc.model_body_opacity(body) >= 0.999
+            && s.doc.face_colors(body).iter().all(|(_, l)| l.opacity >= 0.999)
+        {
+            for (a, b) in crate::cosmetic_threads::segments_with_budget(body, &mesh, &st.threads, &mut thread_budget) {
+                sc.lines.push(SceneLine { points: vec![a, b], color: p.edge, width: 0.85, on_top: false });
+            }
+        }
         for (i, e) in mesh.edges.iter().enumerate() {
             if !mesh.shaded_edge_visible(i) {
                 continue;
@@ -642,21 +677,27 @@ impl SectionIndex {
     }
 }
 
-/// Is a sketch drawn? The active one is; others unless hidden. Finished sketches are hidden
-/// once a feature uses them, by default, unless shown one by one.
+/// Is a sketch drawn? The sketch being edited always is; otherwise not in a hidden component,
+/// Sketches folder or group (even one shown on its own). The sketch immediately before a
+/// rollback marker is shown regardless of its individual visibility; other hidden sketches, and
+/// ones used by a feature unless shown on their own, retain their stored visibility.
 pub fn sketch_shown(s: &Session, id: u64) -> bool {
-    sketch_drawn(s, id, true)
-}
-
-/// Is a sketch drawn, with sketches shown (`folder`) or hidden? The sketch being edited always
-/// is; otherwise not when hidden, nor in a hidden component, Sketches folder or group (even one
-/// shown on its own), and one used by a feature only when shown on its own.
-pub fn sketch_drawn(s: &Session, id: u64, folder: bool) -> bool {
     let v = &s.visibility;
-    if s.active_sketch == Some(id) {
+    if s.active_sketch == Some(id) || s.feature_edit_sketch == Some(id) {
         return true;
     }
-    if !folder || v.hidden_sketches.contains(&id) || !sketch_component_visible(s, id) || s.feature_folder_hidden(id, "sketches") {
+    if !sketch_component_visible(s, id) || s.feature_folder_hidden(id, "sketches") {
+        return false;
+    }
+    if s.doc
+        .marker
+        .and_then(|position| position.checked_sub(1))
+        .and_then(|index| s.doc.features.get(index))
+        .is_some_and(|f| f.id == id && matches!(f.kind, solidcraft_doc::FeatureKind::Sketch { .. }))
+    {
+        return true;
+    }
+    if v.hidden_sketches.contains(&id) {
         return false;
     }
     v.shown_sketches.contains(&id) || !sketch_consumed(s, id)
@@ -901,6 +942,28 @@ mod tests {
             let cap = px().filter(|p| p[0] as i32 - p[2] as i32 > 20).count();
             assert!(cap > 500, "fov {fov}: cap pixels {cap}");
         }
+    }
+
+    /// The cut faces are hatched (stripes over the body's colour tinted toward the cap colour)
+    /// unless the section's `hatch` is off; then the cut is the body's own solid colour.
+    #[test]
+    fn cpu_picture_section_hatch_is_optional() {
+        let mut s = Session::default();
+        s.execute("solid.box", &json!({"length": 40, "width": 30, "height": 20})).unwrap();
+        s.execute("appearance.assign", &json!({"bodies": ["Body1"], "color": [40, 160, 90]})).unwrap();
+        let cam = home_camera(&s);
+        let mut picture = |hatch: bool| {
+            let plane = json!({"origin": [0, 15, 0], "normal": [0, -1, 0]});
+            s.execute("inspect.section", &json!({"plane": plane, "hatch": hatch})).unwrap();
+            solidcraft_render::render(&scene(&s, &cam), &cam, 300, 220).rgba
+        };
+        // Pixels in the body's exact colour: only a plain cut has them (lit faces are shaded).
+        let solid = |img: &[u8]| img.chunks(4).filter(|p| p[..3] == [40, 160, 90]).count();
+        let (hatched, plain) = (picture(true), picture(false));
+        assert!(solid(&plain) > 500, "plain cut: {} pixels in the body's colour", solid(&plain));
+        assert_eq!(solid(&hatched), 0, "the hatched cut is tinted");
+        let shades = |img: &[u8]| img.chunks(4).map(|p| [p[0], p[1], p[2]]).collect::<std::collections::BTreeSet<_>>().len();
+        assert!(shades(&hatched) > shades(&plain), "the hatch adds its stripes' shades");
     }
 }
 
