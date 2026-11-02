@@ -54,6 +54,40 @@ impl CamSettings {
     pub fn post(&self, name: &str) -> Option<&Post> {
         self.posts.iter().find(|p| p.name == name)
     }
+
+    /// The whole of it as a command would leave it: every tool, setup and post valid, and no
+    /// two tools with one number, no two setups (or two operations of a setup, or two posts) with
+    /// one name. A design file is read as it is; this is checked before anything is posted.
+    pub fn validate(&self) -> Result<()> {
+        let twice = |what: &str, name: String| Err(DocError::Invalid(format!("two CAM {what} are both {name}")));
+        let mut numbers = std::collections::BTreeSet::new();
+        for t in &self.tools {
+            t.validate().map_err(|e| DocError::Invalid(e.to_string()))?;
+            if !numbers.insert(t.number) {
+                return twice("tools", format!("number {}", t.number));
+            }
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for setup in &self.setups {
+            setup.validate()?;
+            if !names.insert(setup.name.as_str()) {
+                return twice("setups", format!("`{}`", setup.name));
+            }
+            let mut ops = std::collections::BTreeSet::new();
+            for op in &setup.operations {
+                if !ops.insert(op.name()) {
+                    return twice(&format!("operations of setup `{}`", setup.name), format!("`{}`", op.name()));
+                }
+            }
+        }
+        let mut posts = std::collections::BTreeSet::new();
+        for post in &self.posts {
+            if !posts.insert(post.name.as_str()) {
+                return twice("posts", format!("`{}`", post.name));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One machining setup: work offset, optional stock box, and operations.
@@ -78,6 +112,24 @@ impl CamSetup {
         CamSetup { name: name.into(), work_offset: 1, stock: None, operations: Vec::new() }
     }
 
+    /// Refuses an operation whose rapid moves would run inside the stock: its clearance and
+    /// retract heights must be above the stock's top.
+    pub fn check_clear_of_stock(&self, op: &CamOperation) -> Result<()> {
+        let Some(stock) = &self.stock else { return Ok(()) };
+        let top = stock.max[2];
+        let h = &op.cut().heights;
+        for (what, z) in [("retract", h.retract), ("clearance", h.clearance)] {
+            if !(z > top) {
+                return Err(DocError::Invalid(format!(
+                    "operation `{}`: its {what} height Z{z} is inside the stock of setup `{}`, whose top is Z{top}; give `{what}` above it",
+                    op.name(),
+                    self.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.name.is_empty() || self.name.len() > 128 {
             return Err(DocError::Invalid("a CAM setup name must be 1 to 128 characters".into()));
@@ -93,6 +145,7 @@ impl CamSetup {
         }
         for op in &self.operations {
             op.validate()?;
+            self.check_clear_of_stock(op)?;
         }
         Ok(())
     }
@@ -195,6 +248,12 @@ impl CamOperation {
     pub fn tool(&self) -> u32 {
         match self {
             CamOperation::Contour { tool, .. } | CamOperation::Pocket { tool, .. } => *tool,
+        }
+    }
+
+    pub fn cut(&self) -> &Cut {
+        match self {
+            CamOperation::Contour { cut, .. } | CamOperation::Pocket { cut, .. } => cut,
         }
     }
 

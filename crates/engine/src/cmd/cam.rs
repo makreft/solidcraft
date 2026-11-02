@@ -22,10 +22,11 @@ pub static COMMANDS: &[CommandSpec] = &[
         "number (1…9999); kind?: flat_endmill|ball_endmill|drill (default flat_endmill); diameter (mm); flute_length (mm); \
          description?; flutes?; spindle_rpm?; feed?; plunge_feed?; stepdown?; stepover?; delete?: bool",
     ),
-    CommandSpec::new("cam.setup", "CAM Setup", setup_cmd)
-        .at("MANUFACTURE", "SETUP")
-        .icon("setup")
-        .params("name; work_offset?: 1…6 (G54…G59, default 1); stock?: {min:[x,y,z], max:[x,y,z]}; delete?: bool"),
+    CommandSpec::new("cam.setup", "CAM Setup", setup_cmd).at("MANUFACTURE", "SETUP").icon("setup").params(
+        "name; work_offset?: 1…6 (G54…G59; a new setup takes 1); stock?: {min:[x,y,z], max:[x,y,z]} (work coordinates; \
+             the operations' clearance and retract heights must be above its top) | null (none); an update changes only what \
+             it is given; delete?: bool",
+    ),
     CommandSpec::new("cam.contour", "2D Contour", contour_cmd).at("MANUFACTURE", "MILLING").icon("contour").params(
         "setup; name; tool (number); outer: [[x,y],…] (or regions: [{outer, holes?}], or sketch: id|name with profiles?: \
          all|[index]|[{point:[x,y]}] (default: every profile that is not the inside of another's hole; copied as polygons \
@@ -36,8 +37,9 @@ pub static COMMANDS: &[CommandSpec] = &[
          holes too) | {width?, height?, spacing?, inner?: bool (a part's holes get tabs too, default true)} (mm; bridges \
          left on the last passes so a part cut through stays in the stock; none on a loop shorter than four of them); \
          dogbones?: bool (notch every inside corner the tool leaves round, so a square part fits; default false); \
-         clearance?; retract?; top?; bottom (required unless cut given); stepdown?; feed?; plunge_feed?; spindle_rpm? \
-         (feeds and speed default to the tool's; refused when neither has them); coolant?; cut?: {heights, feeds, \
+         top? (default the setup's stock top, else 0); retract? (default top + 2); clearance? (default top + 10); bottom \
+         (required unless cut given); stepdown?; feed?; plunge_feed?; spindle_rpm? (stepdown, feeds and speed default to the \
+         tool's; refused when neither has them); coolant?; cut?: {heights, feeds, \
          stepdown} → {setup, operation, bounds, too_small?: openings the tool does not fit, left uncut}",
     ),
     CommandSpec::new("cam.pocket", "2D Pocket", pocket_cmd).at("MANUFACTURE", "MILLING").icon("pocket").params(
@@ -69,6 +71,16 @@ fn tool_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         .map(|n| n as u32)
         .ok_or_else(|| bad(cmd, "`number` must be an integer 1…9999"))?;
     if bool_(p, "delete").unwrap_or(false) {
+        let users: Vec<String> = s
+            .doc
+            .cam
+            .setups
+            .iter()
+            .flat_map(|x| x.operations.iter().filter(|o| o.tool() == number).map(move |o| format!("`{}`/`{}`", x.name, o.name())))
+            .collect();
+        if !users.is_empty() {
+            return Err(bad(cmd, format!("tool {number} is used by {}: delete those operations or give them another tool first", users.join(", "))));
+        }
         let doc = s.doc_mut();
         let before = doc.cam.tools.len();
         doc.cam.tools.retain(|t| t.number != number);
@@ -122,16 +134,26 @@ fn setup_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         }
         return Ok(json!({"deleted": name}));
     }
-    let work_offset = num(p, "work_offset").map_or(1u8, |n| n as u8);
+    let work_offset = match p.get("work_offset") {
+        None => None,
+        Some(_) => Some(
+            num(p, "work_offset")
+                .filter(|n| n.fract() == 0.0 && (1.0..=6.0).contains(n))
+                .map(|n| n as u8)
+                .ok_or_else(|| bad(cmd, "`work_offset` must be an integer 1…6 (G54…G59)"))?,
+        ),
+    };
     let stock = match p.get("stock") {
         None => None,
-        Some(v) => Some(stock_box(cmd, v)?),
+        Some(Value::Null) => Some(None),
+        Some(v) => Some(Some(stock_box(cmd, v)?)),
     };
-    let mut setup = CamSetup::new(&name);
-    setup.work_offset = work_offset;
-    setup.stock = stock;
-    if let Some(existing) = s.doc.cam.setup(&name) {
-        setup.operations = existing.operations.clone();
+    let mut setup = s.doc.cam.setup(&name).cloned().unwrap_or_else(|| CamSetup::new(&name));
+    if let Some(w) = work_offset {
+        setup.work_offset = w;
+    }
+    if let Some(stock) = stock {
+        setup.stock = stock;
     }
     setup.validate().map_err(|e| bad(cmd, e.to_string()))?;
     let doc = s.doc_mut();
@@ -180,8 +202,10 @@ fn op_cmd(s: &mut Session, p: &Value, cmd: &str, is_contour: bool) -> Result<Val
     let tool_n =
         num(p, "tool").filter(|n| *n >= 1.0 && n.fract() == 0.0).map(|n| n as u32).ok_or_else(|| bad(cmd, "`tool` must be a tool number"))?;
     let tool = s.doc.cam.tool(tool_n).cloned().ok_or_else(|| bad(cmd, format!("no tool {tool_n} (cam.tool first)")))?;
+    let stock_top =
+        s.doc.cam.setup(&setup_name).ok_or_else(|| bad(cmd, format!("no setup `{setup_name}` (cam.setup first)")))?.stock.map(|b| b.max[2]);
     let regions = regions_param(s, cmd, p)?;
-    let cut = cut_param(cmd, p, &tool)?;
+    let cut = cut_param(cmd, p, &tool, stock_top)?;
     // A machine runs what the program says: no speed made up for a tool that has none.
     let spindle_rpm = num(p, "spindle_rpm")
         .or(tool.spindle_rpm)
@@ -227,6 +251,9 @@ fn op_cmd(s: &mut Session, p: &Value, cmd: &str, is_contour: bool) -> Result<Val
         CamOperation::Pocket { name: name.clone(), tool: tool_n, regions, params, cut, spindle_rpm, coolant }
     };
     op.validate().map_err(|e| bad(cmd, e.to_string()))?;
+    if let Some(setup) = s.doc.cam.setup(&setup_name) {
+        setup.check_clear_of_stock(&op).map_err(|e| bad(cmd, e.to_string()))?;
+    }
     // Prove the toolpath builds before saving the operation.
     build_path(&tool, &op).map_err(|e| bad(cmd, e))?;
     let (bounds, too_small) = reach_report(&tool, &op);
@@ -432,17 +459,21 @@ fn polygon_region(cmd: &str, v: &Value) -> Result<PolygonRegion> {
     Ok(region)
 }
 
-fn cut_param(cmd: &str, p: &Value, tool: &Tool) -> Result<Cut> {
+/// The heights, feeds and depth per pass of an operation. Its top is where the stock's is when the
+/// setup has one; the retract and clearance heights sit 2 and 10 mm above the top unless given.
+fn cut_param(cmd: &str, p: &Value, tool: &Tool, stock_top: Option<f64>) -> Result<Cut> {
     if let Some(raw) = p.get("cut") {
         return serde_json::from_value(raw.clone()).map_err(|e| bad(cmd, format!("`cut` is invalid: {e}")));
     }
     let bottom = num(p, "bottom").ok_or_else(|| bad(cmd, "`bottom` is required (final Z, mm)"))?;
-    let top = num(p, "top").unwrap_or(0.0);
-    let retract = num(p, "retract").unwrap_or(2.0);
-    let clearance = num(p, "clearance").unwrap_or(10.0);
-    let depth = (top - bottom).abs().max(1e-9);
-    let stepdown = num(p, "stepdown").or(tool.stepdown).unwrap_or(depth);
+    let top = num(p, "top").or(stock_top).unwrap_or(0.0);
+    let retract = num(p, "retract").unwrap_or(top + 2.0);
+    let clearance = num(p, "clearance").unwrap_or(top + 10.0);
     let n = tool.number;
+    // As with the feeds: no depth per pass made up (the whole depth at once could break the tool).
+    let stepdown = num(p, "stepdown")
+        .or(tool.stepdown)
+        .ok_or_else(|| bad(cmd, format!("no stepdown: give `stepdown` or set tool {n}'s (cam.tool stepdown)")))?;
     let feed = num(p, "feed").or(tool.feed).ok_or_else(|| bad(cmd, format!("no feed: give `feed` or set tool {n}'s (cam.tool feed)")))?;
     let plunge = num(p, "plunge_feed")
         .or(tool.plunge_feed)
@@ -472,6 +503,7 @@ fn delete_op(s: &mut Session, p: &Value) -> Result<Value> {
 fn post_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.post";
     let setup_name = str_(p, "setup").map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad(cmd, "`setup` is required"))?.to_string();
+    s.doc.cam.validate().map_err(|e| bad(cmd, e.to_string()))?;
     let setup = s.doc.cam.setup(&setup_name).cloned().ok_or_else(|| bad(cmd, format!("no setup `{setup_name}`")))?;
     if setup.operations.is_empty() {
         return Err(bad(cmd, format!("setup `{setup_name}` has no operations")));
@@ -486,7 +518,11 @@ fn post_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         let path = build_path(&tool, op).map_err(|e| bad(cmd, e))?;
         let (spindle_rpm, coolant) = match op {
             CamOperation::Contour { spindle_rpm, coolant, .. } | CamOperation::Pocket { spindle_rpm, coolant, .. } => {
-                (spindle_rpm.or(tool.spindle_rpm).unwrap_or(6000.0), *coolant)
+                // A machine runs what the program says: no speed made up here either.
+                let rpm = spindle_rpm.or(tool.spindle_rpm).ok_or_else(|| {
+                    bad(cmd, format!("operation `{}` has no spindle speed: give it `spindle_rpm` or set tool {}'s", op.name(), tool.number))
+                })?;
+                (rpm, *coolant)
             }
         };
         program.operations.push(Operation { name: op.name().into(), tool, spindle_rpm, coolant, path });
@@ -678,7 +714,11 @@ mod tests {
             json!({"number": 2, "diameter": 3, "flute_length": 12, "kind": "ball_endmill", "spindle_rpm": 18000, "feed": 900, "plunge_feed": 300}),
         );
         run(&mut s, "cam.setup", json!({"name": "S"}));
-        run(&mut s, "cam.contour", json!({"setup": "S", "name": "C", "tool": 2, "outer": [[0,0],[20,0],[20,10],[0,10]], "bottom": -2}));
+        run(
+            &mut s,
+            "cam.contour",
+            json!({"setup": "S", "name": "C", "tool": 2, "outer": [[0,0],[20,0],[20,10],[0,10]], "bottom": -2, "stepdown": 1}),
+        );
         let list = run(&mut s, "cam.list", json!({}));
         assert_eq!(list["tools"].as_array().unwrap().len(), 1);
         assert_eq!(list["setups"][0]["operations"].as_array().unwrap().len(), 1);
@@ -691,8 +731,7 @@ mod tests {
     #[test]
     fn a_post_saved_with_the_design_writes_its_programs() {
         let mut s = Session::default();
-        let ring =
-            |rpm: u32| json!({"setup": "Top", "name": "Ring", "tool": 1, "outer": [[0,0],[40,0],[40,30],[0,30]], "bottom": -2, "spindle_rpm": rpm});
+        let ring = |rpm: u32| json!({"setup": "Top", "name": "Ring", "tool": 1, "outer": [[0,0],[40,0],[40,30],[0,30]], "bottom": -2, "stepdown": 2, "spindle_rpm": rpm});
         run(&mut s, "cam.tool", json!({"number": 1, "diameter": 6, "flute_length": 20, "feed": 1200, "plunge_feed": 400}));
         run(&mut s, "cam.setup", json!({"name": "Top"}));
         run(&mut s, "cam.contour", ring(2000));
@@ -769,7 +808,7 @@ mod tests {
         let hole = run(
             &mut s,
             "cam.contour",
-            json!({"setup": "Sheet", "name": "Hole", "tool": 24, "sketch": "Plate", "profiles": [{"point": [30, 25]}], "side": "inside", "bottom": -1}),
+            json!({"setup": "Sheet", "name": "Hole", "tool": 24, "sketch": "Plate", "profiles": [{"point": [30, 25]}], "side": "inside", "bottom": -1, "stepdown": 1}),
         );
         assert_eq!(hole["bounds"], json!({"min": [20.0, 15.0], "max": [40.0, 35.0]}));
         run(&mut s, "cam.delete_op", json!({"setup": "Sheet", "name": "Hole"}));
@@ -796,5 +835,95 @@ mod tests {
         // Cut through, but the last pass rises over the tabs, 3 mm above the bottom.
         assert!(text.contains("Z-18.3") && text.contains("Z-15.3") && text.contains("S16700") && text.contains("F4010"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The tool and setup the other tests share: a 6 mm cutter with all its cutting data.
+    fn tooled() -> Session {
+        let mut s = Session::default();
+        run(
+            &mut s,
+            "cam.tool",
+            json!({"number": 1, "diameter": 6, "flute_length": 22, "spindle_rpm": 16000, "feed": 1500, "plunge_feed": 500, "stepdown": 3}),
+        );
+        s
+    }
+
+    /// An update of a setup changes what it is given and keeps the rest: a setup on G55 stays on
+    /// G55 when its stock is set, and keeps its stock when its work offset changes.
+    #[test]
+    fn a_setup_update_keeps_what_it_is_not_given() {
+        let mut s = tooled();
+        run(&mut s, "cam.setup", json!({"name": "Top", "work_offset": 2}));
+        run(&mut s, "cam.setup", json!({"name": "Top", "stock": {"min": [0, 0, -18], "max": [100, 50, 0]}}));
+        assert_eq!((s.doc.cam.setups[0].work_offset, s.doc.cam.setups[0].stock.is_some()), (2, true));
+        run(&mut s, "cam.contour", json!({"setup": "Top", "name": "C", "tool": 1, "outer": [[0,0],[40,0],[40,30],[0,30]], "bottom": -3}));
+        run(&mut s, "cam.setup", json!({"name": "Top", "work_offset": 3}));
+        let top = &s.doc.cam.setups[0];
+        assert_eq!((top.work_offset, top.stock.is_some(), top.operations.len()), (3, true, 1));
+        assert!(run(&mut s, "cam.post", json!({"setup": "Top"}))["gcode"].as_str().unwrap().contains("G56"));
+        run(&mut s, "cam.setup", json!({"name": "Top", "stock": null}));
+        assert_eq!((s.doc.cam.setups[0].work_offset, s.doc.cam.setups[0].stock), (3, None));
+        for bad in [json!(1.5), json!(0), json!(7), json!("2")] {
+            assert!(s.execute("cam.setup", &json!({"name": "Top", "work_offset": bad})).is_err(), "{bad}");
+        }
+        assert_eq!(s.doc.cam.setups[0].work_offset, 3);
+    }
+
+    /// No cutting data made up: no depth per pass when neither the operation nor its tool has one,
+    /// and no spindle speed when posting an operation saved without one.
+    #[test]
+    fn no_stepdown_or_spindle_speed_is_made_up() {
+        let mut s = Session::default();
+        run(&mut s, "cam.tool", json!({"number": 1, "diameter": 6, "flute_length": 22, "spindle_rpm": 16000, "feed": 1500, "plunge_feed": 500}));
+        run(&mut s, "cam.setup", json!({"name": "Top"}));
+        let op = json!({"setup": "Top", "name": "C", "tool": 1, "outer": [[0,0],[40,0],[40,30],[0,30]], "bottom": -18});
+        let refused = s.execute("cam.contour", &op).unwrap_err().to_string();
+        assert!(refused.contains("no stepdown"), "{refused}");
+        let mut given = op.clone();
+        given["stepdown"] = json!(6);
+        run(&mut s, "cam.contour", given);
+        // As a design file without the field (an older one, or edited by hand) holds it.
+        if let Some(CamOperation::Contour { spindle_rpm, .. }) = s.doc_mut().cam.setups[0].operations.first_mut() {
+            *spindle_rpm = None;
+        }
+        s.doc_mut().cam.tools[0].spindle_rpm = None;
+        let refused = s.execute("cam.post", &json!({"setup": "Top"})).unwrap_err().to_string();
+        assert!(refused.contains("no spindle speed") && !refused.contains("6000"), "{refused}");
+    }
+
+    /// With a stock on the setup, an operation starts at its top and moves rapidly above it; one
+    /// whose rapid moves would run inside it is refused, also when the stock grows later.
+    #[test]
+    fn rapid_moves_stay_above_the_stock() {
+        let mut s = tooled();
+        run(&mut s, "cam.setup", json!({"name": "Sheet", "stock": {"min": [0, 0, 0], "max": [600, 400, 18]}}));
+        let op = json!({"setup": "Sheet", "name": "C", "tool": 1, "outer": [[0,0],[40,0],[40,30],[0,30]], "bottom": -0.3, "stepdown": 6.1});
+        let mut low = op.clone();
+        low["top"] = json!(0);
+        low["retract"] = json!(2);
+        let refused = s.execute("cam.contour", &low).unwrap_err().to_string();
+        assert!(refused.contains("inside the stock") && refused.contains("Z18"), "{refused}");
+        run(&mut s, "cam.contour", op);
+        let Some(CamOperation::Contour { cut, .. }) = s.doc.cam.setups[0].operations.first() else { panic!("{:?}", s.doc.cam) };
+        assert_eq!((cut.heights.top, cut.heights.retract, cut.heights.clearance), (18.0, 20.0, 28.0));
+        let thicker = s.execute("cam.setup", &json!({"name": "Sheet", "stock": {"min": [0, 0, 0], "max": [600, 400, 25]}})).unwrap_err();
+        assert!(thicker.to_string().contains("inside the stock"), "{thicker}");
+        assert_eq!(s.doc.cam.setups[0].stock.map(|b| b.max[2]), Some(18.0));
+    }
+
+    /// A tool an operation uses is not deleted under it, and two tools with one number (as a file
+    /// edited by hand can hold) are refused before anything is posted.
+    #[test]
+    fn tools_in_use_stay_and_duplicates_are_refused() {
+        let mut s = tooled();
+        run(&mut s, "cam.setup", json!({"name": "Top"}));
+        run(&mut s, "cam.pocket", json!({"setup": "Top", "name": "P", "tool": 1, "outer": [[0,0],[40,0],[40,30],[0,30]], "bottom": -3}));
+        let refused = s.execute("cam.tool", &json!({"number": 1, "delete": true})).unwrap_err().to_string();
+        assert!(refused.contains("`Top`/`P`"), "{refused}");
+        assert_eq!(s.doc.cam.tools.len(), 1);
+        let twin = s.doc.cam.tools[0].clone();
+        s.doc_mut().cam.tools.push(twin);
+        let refused = s.execute("cam.post", &json!({"setup": "Top"})).unwrap_err().to_string();
+        assert!(refused.contains("two CAM tools"), "{refused}");
     }
 }
