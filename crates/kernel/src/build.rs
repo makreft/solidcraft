@@ -1787,15 +1787,18 @@ fn revolve_touching_axis(plane: &Plane, numbered: &NumberedLoop, axis_origin: Ve
     })
 }
 
-/// A planar cap on `wires`. truck's `try_attach_plane` wants every control point of the wire
-/// within its tolerance (1e-6) of one plane; the loft re-fits its sections, and on a sketch
-/// plane that is not axis-aligned the fitted control points miss the plane by rounding, so the
-/// cap of a loft between tilted sections failed ("cannot attach a plane to a wire that is not
-/// on one plane"). Fall back to the plane through the points (Newell), accepting a deviation
-/// of up to `CAP_PLANE_TOL`; an axis-aligned section still takes truck's exact plane.
+/// A planar cap on a loft's section. truck's `try_attach_plane` wants every control point of
+/// the wire within its tolerance (1e-6) of one plane; the loft approximates curved sections
+/// coordinate by coordinate, and on a sketch plane that is not axis-aligned the control points
+/// miss the plane by rounding, so the cap of a loft between tilted sections failed ("cannot
+/// attach a plane to a wire that is not on one plane", #6158). Fall back to the plane through
+/// the points (Newell), accepting a deviation of `CAP_PLANE_REL` of the section's size, at most
+/// `CAP_PLANE_TOL`; a section truck caps exactly still takes truck's plane. Only lofts take the
+/// fallback: helixes and sweeps keep truck's exact test.
 const CAP_PLANE_TOL: f64 = 1e-2;
+const CAP_PLANE_REL: f64 = 1e-4;
 
-fn cap_plane(wires: &[mt::Wire]) -> Result<mt::Face> {
+fn loft_cap_plane(wires: &[mt::Wire]) -> Result<mt::Face> {
     let strict = builder::try_attach_plane(wires);
     let Err(strict_err) = strict else { return strict.map_err(|e| KernelError::Failed(format!("cap: {e}"))) };
     let pts: Vec<mt::Point3> = wires
@@ -1805,7 +1808,8 @@ fn cap_plane(wires: &[mt::Wire]) -> Result<mt::Face> {
     let plane = crate::plane_fit::plane_through(&pts).ok_or_else(|| KernelError::Failed(format!("cap: {strict_err}")))?;
     let (o, n) = (plane.origin(), plane.normal());
     let worst = pts.iter().map(|p| (p - o).dot(n).abs()).fold(0.0_f64, f64::max);
-    if worst > CAP_PLANE_TOL {
+    let size = pts.iter().map(|p| (p - o).magnitude()).fold(0.0_f64, f64::max);
+    if !(worst <= (CAP_PLANE_REL * size).min(CAP_PLANE_TOL)) {
         return Err(KernelError::Failed(format!("cap: {strict_err} (the wire leaves its plane by {worst:.2e} mm)")));
     }
     mt::Face::try_new(wires.to_owned(), plane.into()).map_err(|e| KernelError::Failed(format!("cap: {e}")))
@@ -1815,10 +1819,25 @@ fn cap_plane(wires: &[mt::Wire]) -> Result<mt::Face> {
 /// with planar caps into a body, whose history is the sides' and the caps': the profile at
 /// `w0` is the start cap and at `w1` the end cap (the other way round when `from_end`).
 pub(crate) fn cap_and_close(sides: Vec<Side>, w0: &[mt::Wire], w1: &[mt::Wire], from_end: bool) -> Result<Body> {
+    close_with_caps(sides, w0, w1, from_end, |w| builder::try_attach_plane(w).map_err(|e| KernelError::Failed(format!("cap: {e}"))))
+}
+
+/// [`cap_and_close`] for a loft, whose caps may lie a little off their plane ([`loft_cap_plane`]).
+fn loft_cap_and_close(sides: Vec<Side>, w0: &[mt::Wire], w1: &[mt::Wire], from_end: bool) -> Result<Body> {
+    close_with_caps(sides, w0, w1, from_end, loft_cap_plane)
+}
+
+fn close_with_caps(
+    sides: Vec<Side>,
+    w0: &[mt::Wire],
+    w1: &[mt::Wire],
+    from_end: bool,
+    cap: impl Fn(&[mt::Wire]) -> Result<mt::Face>,
+) -> Result<Body> {
     let (mut faces, prov): (Vec<mt::Face>, Vec<Option<FaceProv>>) = sides.into_iter().unzip();
     let history: Option<Vec<FaceProv>> = prov.into_iter().chain([Some(record::cap(from_end)), Some(record::cap(!from_end))]).collect();
-    let bottom = cap_plane(&w0.iter().map(|w| w.inverse()).collect::<Vec<_>>())?;
-    let top = cap_plane(w1)?;
+    let bottom = cap(&w0.iter().map(|w| w.inverse()).collect::<Vec<_>>())?;
+    let top = cap(w1)?;
     let mut last = String::new();
     for (b, t) in [(bottom.clone(), top.clone()), (bottom.inverse(), top.inverse()), (bottom.clone(), top.inverse()), (bottom.inverse(), top)] {
         let mut all = std::mem::take(&mut faces);
@@ -1867,7 +1886,7 @@ pub fn loft_with_rails(sections: &[(Plane, Loop2)], rails: &[Vec<Vec3>], fit: Ra
     if all.len() >= 3 {
         let smooth = guard("loft", || {
             let faces = smooth_loft_faces(&all, &edge_sources, true)?;
-            cap_and_close(faces, std::slice::from_ref(first), std::slice::from_ref(last), reversed)
+            loft_cap_and_close(faces, std::slice::from_ref(first), std::slice::from_ref(last), reversed)
         });
         if smooth.is_ok() || !rails.is_empty() {
             return smooth;
@@ -1875,7 +1894,7 @@ pub fn loft_with_rails(sections: &[(Plane, Loop2)], rails: &[Vec<Vec3>], fit: Ra
     }
     guard("loft", || {
         let sides = ruled_loft_faces(&wires, &edge_sources)?;
-        cap_and_close(sides, std::slice::from_ref(first), std::slice::from_ref(last), reversed)
+        loft_cap_and_close(sides, std::slice::from_ref(first), std::slice::from_ref(last), reversed)
     })
 }
 
@@ -1986,7 +2005,7 @@ pub fn loft_regions(sections: &[(Plane, Region2)]) -> Result<Body> {
                     last.push(b.inverse());
                 }
             }
-            cap_and_close(sides, &first, &last, reversed)
+            loft_cap_and_close(sides, &first, &last, reversed)
         };
         if sections.len() >= 3
             && let Ok(body) = guard("smooth loft with holes", || close(true))
