@@ -90,7 +90,11 @@ pub struct ParamRow {
     pub name: String,
     pub expression: String,
     pub unit: String,
+    /// Always millimetres for a length, degrees for an angle, whatever the parameter's own
+    /// unit — the same meaning `value` has in every reply (#10747).
     pub value: Option<f64>,
+    /// The value in the parameter's own `unit`, as the Parameters window shows it.
+    pub display_value: Option<f64>,
     pub error: Option<String>,
     pub comment: String,
     /// "user", "sketch" (a dimension) or "feature".
@@ -225,6 +229,12 @@ impl Document {
     /// A typed length that is a bare number means the design's units: it gets that unit written
     /// in (feature inputs are stored in mm otherwise). Anything else is returned unchanged.
     pub fn with_design_unit(&self, e: &str, kind: Kind) -> String {
+        // A definition's value reads as the value would (#4071): `w = 2` is `w = 2 in`.
+        if let Some((name, rhs)) = expr::definition(e)
+            && expr::is_bare_number(rhs)
+        {
+            return format!("{name} = {}", self.with_design_unit(rhs, kind));
+        }
         let u = self.units.trim();
         let bare = expr::is_bare_number(e);
         if kind == Kind::Length && bare && !u.is_empty() && u != "mm" && expr::unit_info(u).is_some_and(|(k, _)| k == Kind::Length) {
@@ -232,6 +242,22 @@ impl Document {
         } else {
             e.to_string()
         }
+    }
+
+    /// A measured length (mm) written as a value in the design's units, with its unit: `1 in`
+    /// for 25.4 mm in an inch design. Kept to the micrometre, as a millimetre value would be, so
+    /// a dimension that restates the geometry moves nothing. Returns (unit, expression).
+    pub fn design_length(&self, mm: f64) -> (String, String) {
+        let u = self.units.trim();
+        let per_unit = match expr::unit_info(u) {
+            Some((Kind::Length, s)) if u != "mm" && s.is_finite() && s > 0.0 => s,
+            _ => return ("mm".into(), format!("{} mm", (mm * 1e6).round() / 1e6)),
+        };
+        let decimals = (-(1e-6 / per_unit).log10()).ceil().clamp(0.0, 12.0) as usize;
+        let text = format!("{:.*}", decimals, mm / per_unit);
+        let text = if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.') } else { &text };
+        let text = if text == "-0" { "0" } else { text };
+        (u.into(), format!("{text} {u}"))
     }
 
     /// Every length input of every feature as the geometry reads it (mm; a unit-less result is
@@ -246,7 +272,7 @@ impl Document {
             .filter(|(_, _, k)| *k == Kind::Length)
             .map(|(_, e, _)| {
                 let d = if expr::is_literal(&e) { expr::Defaults::default() } else { expr::Defaults { len: scale, ..expr::Defaults::default() } };
-                expr::eval_with(&e, &look).and_then(|v| v.to_kind_in(Kind::Length, d)).ok()
+                expr::eval_with_defaults(&e, &look, d).and_then(|v| v.to_kind_in(Kind::Length, d)).ok()
             })
             .collect()
     }
@@ -345,14 +371,20 @@ impl Document {
             }
         }
         let used_by = |n: &str| -> Vec<String> { users.get(n).cloned().unwrap_or_default() };
-        let value = |n: &str, k: Kind| vals.get(n).and_then(|v| v.to_kind(k).ok()).map(|x| if k == Kind::Angle { x.to_degrees() } else { x });
+        let value = |n: &str, k: Kind| {
+            vals.get(n).and_then(|v| v.to_kind(k).ok()).map(|x| if k == Kind::Angle { x.to_degrees() } else { x }).map(expr::round_reported)
+        };
+        // `value` is mm / degrees in every row (#10747); the parameter's own unit goes to
+        // `display_value`. Both carry the number a person would read, not the float noise.
+        let unified = |n: &str| vals.get(n).map(|v| expr::round_reported(expr::reported_value(*v)));
         let mut rows = Vec::new();
         for p in &self.params {
             rows.push(ParamRow {
                 name: p.name.clone(),
                 expression: p.expr.clone(),
                 unit: p.unit.clone(),
-                value: self.param_display_value(&vals, &p.name),
+                value: unified(&p.name),
+                display_value: self.param_display_value(&vals, &p.name).map(expr::round_reported),
                 error: errs.get(&p.name).cloned(),
                 comment: p.comment.clone(),
                 source: if p.model { "sketch" } else { "user" },
@@ -374,6 +406,8 @@ impl Document {
                     expression: e,
                     unit: unit_of(k).into(),
                     value: value(name, k),
+                    // A feature input's own unit is mm / deg, so its display value is its value.
+                    display_value: value(name, k),
                     error: errs.get(name).cloned(),
                     comment: self.param_comments.get(name).cloned().unwrap_or_default(),
                     source: "feature",
@@ -393,6 +427,7 @@ impl Document {
                 expression: p.text.clone(),
                 unit: crate::text_params::TEXT_UNIT.into(),
                 value: None,
+                display_value: None,
                 error: None,
                 comment: p.comment.clone(),
                 source: "user",
@@ -438,9 +473,10 @@ impl Document {
         Ok(())
     }
 
-    /// User parameters as CSV (`name,unit,expression,value,comment`).
+    /// User parameters as CSV (`name,unit,expression,value,comment`). The `value` column is the
+    /// number in the `unit` column, rounded for reading (#10747); import reads `expression`.
     pub fn params_csv(&self) -> String {
-        let q = |s: &str| if s.contains([',', '"', '\n']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() };
+        let q = |s: &str| if s.contains([',', '"', '\r', '\n']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() };
         let mut out = String::from("name,unit,expression,value,comment,favorite\n");
         for r in self.param_rows().into_iter().filter(|r| r.source == "user") {
             out += &format!(
@@ -448,7 +484,7 @@ impl Document {
                 q(&r.name),
                 q(&r.unit),
                 q(&r.expression),
-                r.value.map(|v| format!("{v}")).unwrap_or_default(),
+                r.display_value.or(r.value).map(|v| format!("{v}")).unwrap_or_default(),
                 q(&r.comment),
                 r.favorite
             );
@@ -475,23 +511,25 @@ impl Document {
                 })
                 .collect::<Result<_>>()?
         } else {
-            let mut lines = text.lines();
-            let header: Vec<String> = parse_csv_line(lines.next().unwrap_or_default()).into_iter().map(|h| h.trim().to_ascii_lowercase()).collect();
-            let col = |n: &str| header.iter().position(|h| h == n);
+            let mut records = split_csv(text.strip_prefix('\u{feff}').unwrap_or(text), '\n');
+            let header = csv_fields(records.next().unwrap_or_default())?;
+            let col = |n: &str| header.iter().position(|h| h.trim().eq_ignore_ascii_case(n));
             let (Some(ni), Some(ei)) = (col("name"), col("expression").or(col("value"))) else {
                 return Err(DocError::Invalid("the CSV needs `name` and `expression` columns".into()));
             };
             let (ui, ci) = (col("unit"), col("comment"));
-            lines
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| {
-                    let c = parse_csv_line(l);
+            records
+                .filter(|record| !record.trim().is_empty())
+                .take(MAX_PARAMS + 1)
+                .map(|record| {
+                    let c = csv_fields(record)?;
                     let get = |i: Option<usize>| i.and_then(|i| c.get(i)).map(|s| s.trim().to_string());
-                    (get(Some(ni)).unwrap_or_default(), get(Some(ei)).unwrap_or_default(), get(ui), get(ci))
+                    let comment = ci.and_then(|i| c.get(i)).cloned();
+                    Ok((get(Some(ni)).unwrap_or_default(), get(Some(ei)).unwrap_or_default(), get(ui), comment))
                 })
-                .collect()
+                .collect::<Result<_>>()?
         };
-        if rows.len() > 10_000 {
+        if rows.len() > MAX_PARAMS {
             return Err(DocError::Invalid("too many parameters".into()));
         }
         // Each row is checked and applied as `change_param` would, but the parameters are
@@ -563,7 +601,7 @@ impl Document {
                 }
                 let unit = match unit {
                     Some(u) => u.trim().to_string(),
-                    None => Self::infer_unit_in(vals, expr_s),
+                    None => Self::infer_unit_in(vals, expr_s, &self.units),
                 };
                 self.params.push(crate::Param {
                     name: name.into(),
@@ -674,18 +712,19 @@ impl Document {
     }
 
     /// The unit for a new parameter with this expression: that of its value; a bare number is
-    /// a length (mm).
+    /// a length in the design's units, as a typed length reads it (#8865).
     pub(crate) fn infer_unit(&self, e: &str) -> String {
-        Self::infer_unit_in(&self.param_values().0, e)
+        Self::infer_unit_in(&self.param_values().0, e, &self.units)
     }
 
-    /// [`Document::infer_unit`] against parameter values already worked out.
-    fn infer_unit_in(vals: &BTreeMap<String, Value>, e: &str) -> String {
+    /// [`Document::infer_unit`] against parameter values already worked out, a length taking
+    /// `units` (the design's, or `mm` where a bare number reads as millimetres).
+    pub(crate) fn infer_unit_in(vals: &BTreeMap<String, Value>, e: &str, units: &str) -> String {
         let v = expr::eval_with(e, &|n| vals.get(n).copied().ok_or_else(|| DocError::Expr(format!("unknown parameter `{n}`"))));
         match v.ok().and_then(|v| v.kind()) {
             Some(Kind::Unitless) if !expr::references(e).is_empty() => String::new(),
             Some(Kind::Angle) => "deg".into(),
-            _ => "mm".into(),
+            _ => expr::length_unit_or_mm(units).to_string(),
         }
     }
 
@@ -874,6 +913,18 @@ impl Document {
                         n += 1;
                     }
                 }
+                // An equation curve's variable hides a parameter of its name: such a parameter is
+                // not what its formulas refer to.
+                for (variable, e) in sketch.equation_exprs_mut() {
+                    if variable == old {
+                        continue;
+                    }
+                    let r = expr::rename_reference(e, old, new);
+                    if r != *e {
+                        *e = r;
+                        n += 1;
+                    }
+                }
                 for e in sketch.text_word_exprs_mut() {
                     let r = crate::text_params::rename_reference(e, old, new);
                     if r != *e {
@@ -1034,25 +1085,32 @@ impl Document {
     }
 }
 
-/// One CSV line with quoted fields.
-fn parse_csv_line(l: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
+/// Split records or fields only outside quotes. A doubled quote toggles twice
+/// before the next separator, leaving it inside the same field.
+fn split_csv(text: &str, separator: char) -> impl Iterator<Item = &str> {
     let mut quoted = false;
-    let mut chars = l.chars().peekable();
-    while let Some(c) = chars.next() {
-        match (c, quoted) {
-            ('"', true) if chars.peek() == Some(&'"') => {
-                cur.push('"');
-                chars.next();
-            }
-            ('"', _) => quoted = !quoted,
-            (',', false) => out.push(std::mem::take(&mut cur)),
-            (c, _) => cur.push(c),
+    text.split(move |c| {
+        if c == '"' {
+            quoted = !quoted;
         }
-    }
-    out.push(cur);
-    out
+        c == separator && !quoted
+    })
+}
+
+fn csv_fields(record: &str) -> Result<Vec<String>> {
+    split_csv(record, ',')
+        .map(|raw| {
+            let field = raw.trim();
+            if !field.contains('"') {
+                return Ok(field.to_string());
+            }
+            let inner = field.strip_prefix('"').and_then(|s| s.strip_suffix('"'));
+            match inner {
+                Some(s) if s.split("\"\"").all(|part| !part.contains('"')) => Ok(s.replace("\"\"", "\"")),
+                _ => Err(DocError::Invalid("invalid quoting in parameter CSV".into())),
+            }
+        })
+        .collect()
 }
 
 /// Parameters whose definitions depend on each other in a loop.
@@ -1087,4 +1145,57 @@ pub(crate) fn numbers_after<'a>(base: &str, names: impl Iterator<Item = &'a str>
         .filter(|digits| !digits.is_empty() && !digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit()))
         .filter_map(|digits| digits.parse().ok())
         .collect()
+}
+
+#[cfg(test)]
+mod design_length_tests {
+    use crate::Document;
+
+    fn written(units: &str, mm: f64) -> (String, String) {
+        let mut doc = Document::new("Units");
+        doc.units = units.into();
+        doc.design_length(mm)
+    }
+
+    #[test]
+    fn a_measured_length_is_written_in_the_design_units() {
+        let w = |u: &str, e: &str| (u.to_string(), e.to_string());
+        assert_eq!(written("in", 25.4), w("in", "1 in"));
+        assert_eq!(written("in", 12.7), w("in", "0.5 in"));
+        assert_eq!(written("in", 10.0), w("in", "0.39370079 in"));
+        assert_eq!(written("cm", 12.34), w("cm", "1.234 cm"));
+        assert_eq!(written("mm", 12.3456789), w("mm", "12.345679 mm"));
+        assert_eq!(written("in", -25.4), w("in", "-1 in"));
+        assert_eq!(written("in", -1e-12), w("in", "0 in"));
+        // Unknown or non-length units keep millimetres.
+        assert_eq!(written("parsec", 5.0), w("mm", "5 mm"));
+        assert_eq!(written("deg", 5.0), w("mm", "5 mm"));
+        assert_eq!(written("", 5.0), w("mm", "5 mm"));
+    }
+
+    /// A bare number typed as a formula (`=5`) means the design's units like `5` does.
+    #[test]
+    fn a_formula_that_is_a_bare_number_gets_the_design_unit() {
+        let mut doc = Document::new("Units");
+        doc.units = "in".into();
+        let length = crate::expr::Kind::Length;
+        assert_eq!(doc.with_design_unit("5", length), "5 in");
+        assert_eq!(doc.with_design_unit("=5", length), "=5 in");
+        assert_eq!(doc.with_design_unit("=5 mm", length), "=5 mm");
+        let inches = doc.eval(&doc.with_design_unit("=5", length), length).unwrap();
+        assert!((inches - 127.0).abs() < 1e-9, "{inches}");
+    }
+
+    #[test]
+    fn the_written_value_reads_back_within_a_micrometre() {
+        for units in ["mm", "cm", "m", "in", "ft"] {
+            let mut doc = Document::new("Units");
+            doc.units = units.into();
+            for mm in [0.001, 1.0, 12.345_678_9, 25.4, 999.999, 12_345.678] {
+                let (_, e) = doc.design_length(mm);
+                let back = doc.eval(&e, crate::expr::Kind::Length).unwrap();
+                assert!((back - mm).abs() <= 1e-6, "{units} {mm}: {e} reads {back}");
+            }
+        }
+    }
 }

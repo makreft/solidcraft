@@ -1,9 +1,9 @@
 //! Building bodies: extrude and revolve planar regions, primitives.
 
-use truck_modeling::{Homogeneous, InnerSpace};
 use mt::builder;
 use solidcraft_geom::{Grid, Loop2, Plane, Region2, Ring, Seg2, Vec2, Vec3};
 use truck_modeling as mt;
+use truck_modeling::{Homogeneous, InnerSpace};
 
 use crate::body::{Body, Solid, from_p3, p3, v3};
 use crate::history::FaceProv;

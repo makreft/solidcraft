@@ -12,7 +12,9 @@ use solidcraft_engine::geom::Vec3;
 
 use crate::SolveApp;
 use crate::dialogs::{Kind, OP_LABELS, OPS, combo, form_row, op_index};
-use crate::selection::{AXES, BODIES, CURVES, EDGES, FACES, PLANES, PROFILES, SelInput, SelectionExt as _, VERTICES, items, point_value as pt};
+use crate::selection::{
+    AXES, AXIS_PICKS, BODIES, CURVES, EDGES, FACES, PLANES, PROFILES, SelInput, SelectionExt as _, VERTICES, items, point_value as pt,
+};
 use crate::ui_kit;
 
 crate::dialog_descriptor::dialog_descriptors! {
@@ -158,7 +160,7 @@ const RULED_MODES: [(&str, &str); 4] = [("Normal", "normal"), ("Tangent", "tange
 fn inputs(k: &Surf) -> Vec<SelInput> {
     match k {
         Surf::Extrude { .. } => vec![SelInput::new("Profiles or curves", PROFILES | CURVES, true)],
-        Surf::Revolve { .. } => vec![SelInput::new("Profiles or curves", PROFILES | CURVES, true), SelInput::new("Axis", AXES, false)],
+        Surf::Revolve { .. } => vec![SelInput::new("Profiles or curves", PROFILES | CURVES, true), SelInput::new("Axis", AXIS_PICKS, false)],
         Surf::Sweep(_) => {
             let [rail, rail2] = crate::dialogs_sweep::rail_inputs();
             vec![
@@ -171,7 +173,7 @@ fn inputs(k: &Surf) -> Vec<SelInput> {
         }
         Surf::Loft { .. } => {
             let [rail, rail2] = crate::dialogs_sweep::rail_inputs();
-            vec![SelInput::new("Sections (one sketch each)", PROFILES | CURVES, true), rail, rail2]
+            vec![SelInput::new("Sections", PROFILES | CURVES, true), rail, rail2]
         }
         Surf::Blend { .. } => vec![SelInput::new("From edges", EDGES, true), SelInput::new("To edges", EDGES, true)],
         Surf::Boundary { .. } => vec![SelInput::new("Curves", CURVES | EDGES, true), SelInput::new("Cross curves", CURVES | EDGES, true)],
@@ -223,7 +225,7 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Surf) -> bool {
     let mut enter = false;
     match k {
         Surf::Stitch { tolerance } => {
-            enter |= hint_row(ui, "Tolerance", tolerance, "tight");
+            enter |= hint_row(ui, "Tolerance", tolerance, crate::i18n::tr("ui.stitch_tolerance_hint"));
         }
         Surf::Thicken { thickness, symmetric, operation } => {
             enter |= expr_row(ui, "Thickness", thickness);
@@ -493,7 +495,8 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
             p["axis"] = match items(inputs, 1).first() {
                 Some(Sel::Axis { name }) => json!(name),
                 Some(Sel::SketchCurve { id, .. }) => json!(id),
-                _ => axis.clone().ok_or("select an axis")?,
+                Some(x) => crate::dialogs::axis_param(app, x)?,
+                None => axis.clone().ok_or("select an axis")?,
             };
             p["angle"] = json!(angle);
             if *symmetric {
@@ -514,30 +517,37 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
             ("surface.sweep", p)
         }
         Surf::Loft { rail_fit } => {
-            need(0, "the sections, one sketch each")?;
-            // One section per sketch, in the order the sketches were first picked.
-            let sketch_of = |x: &Sel| match x {
-                Sel::Profile { sketch, .. } => Some(*sketch),
-                Sel::SketchCurve { .. } => crate::dialogs::picks_sketch(app, std::slice::from_ref(x), None),
-                _ => None,
-            };
-            let mut order: Vec<u64> = Vec::new();
-            for x in items(inputs, 0) {
-                let sk = sketch_of(x).ok_or("a picked curve is no longer in a sketch")?;
-                if !order.contains(&sk) {
-                    order.push(sk);
+            need(0, "the sections")?;
+            // Each picked profile is a section, and so is each chain of picked curves (those of
+            // one sketch that meet end to end), in the order of their first pick: two sections
+            // can come from one sketch (#8221).
+            let picks = items(inputs, 0);
+            let curves: Vec<Sel> = picks.iter().filter(|x| matches!(x, Sel::SketchCurve { .. })).cloned().collect();
+            let mut chained: Vec<Option<Chain>> = chains(app, &curves)?.into_iter().map(Some).collect();
+            let mut sections: Vec<Value> = Vec::new();
+            let mut sketches: Vec<u64> = Vec::new();
+            for x in picks {
+                match x {
+                    Sel::Profile { sketch, index } => {
+                        sections.push(json!({"sketch": sketch, "profiles": [index]}));
+                        sketches.push(*sketch);
+                    }
+                    Sel::SketchCurve { id, .. } => {
+                        let sk = crate::dialogs::picks_sketch(app, std::slice::from_ref(x), None).ok_or("a picked curve is no longer in a sketch")?;
+                        let holds = |c: &Option<Chain>| matches!(c, Some(Chain::Sketch { sketch, ids }) if *sketch == sk && ids.contains(id));
+                        if let Some(Some(Chain::Sketch { sketch, ids })) = chained.iter_mut().find(|c| holds(c)).map(Option::take) {
+                            sections.push(json!({"sketch": sketch, "curves": ids}));
+                            sketches.push(sketch);
+                        }
+                    }
+                    _ => {}
                 }
             }
-            if order.len() < 2 {
+            sketches.sort_unstable();
+            sketches.dedup();
+            if sketches.len() < 2 {
                 return Err("pick sections in two or more sketches".into());
             }
-            let sections: Vec<Value> = order
-                .iter()
-                .map(|sk| {
-                    let picks: Vec<Sel> = items(inputs, 0).iter().filter(|x| sketch_of(x) == Some(*sk)).cloned().collect();
-                    sheet_picks(app, &picks)
-                })
-                .collect::<Result<_, String>>()?;
             let mut p = json!({ "sections": sections });
             crate::dialogs_sweep::rail_params(app, *rail_fit, [items(inputs, 1), items(inputs, 2)], &mut p)?;
             ("surface.loft", p)
@@ -818,6 +828,11 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
                         "dir": pt(solidcraft_engine::doc::apply_vector(frame, dir.0))
                     })),
                 ),
+                // An edge or face that is gone stays the reference until another is picked.
+                AxisRef::Model { geo } => match crate::dialogs::model_axis_sel(s, geo) {
+                    Some(pick) => (Some(pick), None),
+                    None => (None, serde_json::to_value(geo).ok()),
+                },
             };
             let mut extra = Map::new();
             if let Some(a2) = angle2 {
@@ -1015,8 +1030,9 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
                 Some(solidcraft_engine::doc::ExtendTo::Plane(PlaneRef::Origin { name })) => {
                     extra.insert("up_to".into(), json!(name));
                 }
-                Some(solidcraft_engine::doc::ExtendTo::Plane(PlaneRef::Construction { name })) => {
-                    extra.insert("up_to".into(), json!(name));
+                Some(solidcraft_engine::doc::ExtendTo::Plane(PlaneRef::Construction { feature })) => {
+                    let shown = s.doc.feature(feature.0).map(|f| json!(f.name)).unwrap_or_else(|| json!(feature.0));
+                    extra.insert("up_to".into(), shown);
                 }
                 _ => {}
             }

@@ -170,6 +170,55 @@ fn feature_circular_center_flip_uses_partial_arc_endpoints_and_full_circle_spaci
     }
 }
 
+/// A pattern made with the timeline rolled back to the start comes before the box it copies and
+/// replays the box from its definition. A change of the box's parameter reaches the copies as it
+/// reaches the box: the pattern's result was kept (its copies the old length) because nothing
+/// before it in the timeline had changed.
+#[test]
+fn a_pattern_before_the_feature_it_copies_follows_that_features_parameter() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "w", "expression": "18 mm"}));
+    run(&mut s, "solid.box", json!({"length": "w", "width": 10, "height": 10}));
+    run(&mut s, "timeline.rollback", json!({"position": 0}));
+    run(&mut s, "solid.pattern.rectangular", json!({"features": ["Box1"], "dir1": [1, 0, 0], "count1": 2, "spacing1": 30}));
+    let lengths = |st: &solidcraft_doc::ModelState| {
+        st.bodies.iter().map(|b| (b.name.clone(), b.body.outline_bounds())).map(|(n, bb)| (n, bb.max.x - bb.min.x)).collect::<Vec<_>>()
+    };
+    let fresh = |s: &Session| {
+        let mut m = solidcraft_doc::Model::new();
+        m.no_cache = true;
+        m.evaluate(&s.doc);
+        lengths(&m.state())
+    };
+    for step in [json!({"name": "w", "expression": "21 mm"}), json!({"name": "w", "expression": "25 mm"})] {
+        run(&mut s, "parameters.change", step);
+        assert_eq!(lengths(&s.model.state()), fresh(&s), "rolled back");
+        run(&mut s, "timeline.rollback", json!({}));
+        assert_eq!(lengths(&s.model.state()), fresh(&s), "rolled forward");
+        run(&mut s, "timeline.rollback", json!({"position": 1}));
+    }
+    run(&mut s, "timeline.rollback", json!({}));
+    let got = lengths(&s.model.state());
+    assert!(got.len() == 2 && got.iter().all(|(_, l)| (l - 25.0).abs() < 1e-9), "the box and its copy, 25 mm: {got:?}");
+}
+
+/// A pattern whose source was deleted copies nothing. A feature made later under the freed name
+/// is found by that name, after the pattern in the timeline: the model is what a fresh evaluation
+/// makes of the design, where the pattern's empty result had been kept.
+#[test]
+fn a_pattern_finds_a_later_feature_that_takes_its_deleted_sources_name() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 2, "height": 15, "axis": "Y", "base": [-16, 6, -5]}));
+    run(&mut s, "solid.pattern.rectangular", json!({"features": ["Cylinder1"], "dir1": [1, 0, 0], "count1": 2, "spacing1": 19}));
+    run(&mut s, "timeline.delete", json!({"feature": "Cylinder1"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 5, "height": 19, "base": [-3, -7, -1]}));
+    let bodies = |st: &solidcraft_doc::ModelState| st.bodies.iter().map(|b| (b.name.clone(), b.body.outline_bounds().min.x)).collect::<Vec<_>>();
+    let mut fresh = solidcraft_doc::Model::new();
+    fresh.no_cache = true;
+    fresh.evaluate(&s.doc);
+    assert_eq!(bodies(&s.model.state()), bodies(&fresh.state()));
+}
+
 #[test]
 fn feature_pattern_rejects_malformed_alignment_and_flip_atomically() {
     let mut s = feature_pattern_plate();
@@ -191,27 +240,79 @@ fn circular_axis_origin_rejects_invalid_values_atomically() {
     run(&mut s, "parameters.add", json!({"name":"cy","expression":"25 mm"}));
     let before = s.doc.to_json();
     let undo = s.undo.len();
-    for origin in [
-        json!(["cx", "cy", 0]),
-        json!(["50", 25, 0]),
-        json!([0, 0]),
-        json!([0, 0, 0, 0]),
-        json!(null),
-        json!(false),
-        json!({"x":0,"y":0}),
-        json!([1e9, 0, 0]),
-        json!([0, 1e100, 0]),
-    ] {
-        for (cmd, params) in [
-            ("solid.pattern.circular", json!({"features":["Hole1"],"axis":{"origin":origin,"dir":[0,0,1]},"count":4})),
-            ("construct.plane.at_angle", json!({"base":"XY","axis":{"origin":origin,"dir":[1,0,0]},"angle":45})),
-        ] {
-            let error = s.execute(cmd, &params).unwrap_err().to_string();
-            assert!(error.contains("axis.origin") && error.contains("expressions are not supported"), "{error}");
-            assert_eq!(s.doc.to_json(), before);
-            assert_eq!(s.undo.len(), undo);
-        }
+    let invalid = [json!([0, 0]), json!([0, 0, 0, 0]), json!(null), json!(false), json!({"x":0,"y":0}), json!([1e9, 0, 0]), json!([0, 1e100, 0])];
+    // A circular pattern's origin takes length expressions (#10852); an angled plane's doesn't.
+    for origin in invalid.iter().chain(&[json!(["nope", 0, 0]), json!(["2 deg", 0, 0])]) {
+        let params = json!({"features":["Hole1"],"axis":{"origin":origin,"dir":[0,0,1]},"count":4});
+        let error = s.execute("solid.pattern.circular", &params).unwrap_err().to_string();
+        assert!(error.contains("axis.origin"), "{origin}: {error}");
+        assert_eq!(s.doc.to_json(), before);
+        assert_eq!(s.undo.len(), undo);
     }
+    for origin in invalid.iter().chain(&[json!(["cx", "cy", 0]), json!(["50", 25, 0])]) {
+        let params = json!({"base":"XY","axis":{"origin":origin,"dir":[1,0,0]},"angle":45});
+        let error = s.execute("construct.plane.at_angle", &params).unwrap_err().to_string();
+        assert!(error.contains("axis.origin") && error.contains("expressions are not supported"), "{error}");
+        assert_eq!(s.doc.to_json(), before);
+        assert_eq!(s.undo.len(), undo);
+    }
+}
+
+/// #10852: a circular pattern about `{origin, dir}` with length expressions in the origin turns
+/// about the point they give now, so the copies follow the parameters as the seed does. The
+/// expressions are saved, renamed with their parameter, and can be set by `timeline.edit`.
+#[test]
+fn circular_axis_origin_expressions_follow_their_parameters() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name":"cx","expression":"50 mm"}));
+    run(&mut s, "parameters.add", json!({"name":"cy","expression":"40 mm"}));
+    // A 2 mm cube 20 mm from (cx, cy), turned about the vertical line there.
+    run(&mut s, "solid.box", json!({"length":2,"width":2,"height":2,"corner":["cx + 20 mm","cy",0],"body_name":"Cube"}));
+    run(&mut s, "solid.pattern.circular", json!({"bodies":["Cube"],"axis":{"origin":["cx","cy",0],"dir":[0,0,1]},"count":4}));
+    // The x and y extent of the four cubes: 22 mm either side of the axis while it is 20 mm away.
+    let span = |s: &Session| {
+        let st = s.model.state();
+        assert_eq!(st.bodies.len(), 4);
+        let mut out = [f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY];
+        for b in st.bodies.iter().filter_map(|mb| solidcraft_kernel::measure(&mb.body).ok()).map(|m| m.bbox) {
+            out = [out[0].min(b.min.x), out[1].max(b.max.x), out[2].min(b.min.y), out[3].max(b.max.y)];
+        }
+        out
+    };
+    let about_at = |s: &Session, x: f64, y: f64, half: f64| {
+        for (got, want) in span(s).into_iter().zip([x - half, x + half, y - half, y + half]) {
+            assert!((got - want).abs() < 1e-6, "{:?} is not {half} mm either side of ({x}, {y})", span(s));
+        }
+    };
+    let about = |s: &Session, x: f64, y: f64| about_at(s, x, y, 22.0);
+    // The origin as the pattern saves it.
+    let saved_origin = |s: &Session| match s.doc.features.last().map(|f| &f.kind) {
+        Some(solidcraft_doc::FeatureKind::Pattern { pattern, .. }) => serde_json::to_value(pattern).unwrap_or_default()["origin"].clone(),
+        other => panic!("not a pattern: {other:?}"),
+    };
+    about(&s, 50.0, 40.0);
+    assert_eq!(saved_origin(&s), json!(["cx", "cy", 0.0]), "the expressions are saved");
+    run(&mut s, "parameters.change", json!({"name":"cx","expression":"60 mm"}));
+    about(&s, 60.0, 40.0);
+    // Renaming a parameter renames it in the origin, and the pattern still follows it.
+    run(&mut s, "parameters.rename", json!({"name":"cy","new_name":"py"}));
+    run(&mut s, "parameters.change", json!({"name":"py","expression":"45 mm"}));
+    about(&s, 60.0, 45.0);
+    assert_eq!(saved_origin(&s), json!(["cx", "py", 0.0]));
+    let reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap_or_else(|e| panic!("{e}")));
+    about(&reopened, 60.0, 45.0);
+    // timeline.edit sets the origin as expressions too: 10 mm back, so the cube is 30 mm away.
+    let pattern = s.doc.features.last().map(|f| f.id).unwrap_or_default();
+    run(&mut s, "timeline.edit", json!({"feature":pattern,"set":{"pattern.origin":["cx - 10 mm","py","0 mm"]}}));
+    about_at(&s, 50.0, 45.0, 32.0);
+    run(&mut s, "edit.undo", json!({}));
+    about(&s, 60.0, 45.0);
+    // Plain numbers are saved as numbers, as before.
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length":2,"width":2,"height":2,"corner":[70,40,0],"body_name":"Cube"}));
+    run(&mut s, "solid.pattern.circular", json!({"bodies":["Cube"],"axis":{"origin":[50,40,0],"dir":[0,0,1]},"count":4}));
+    about(&s, 50.0, 40.0);
+    assert_eq!(saved_origin(&s), json!([50.0, 40.0, 0.0]));
 }
 
 #[test]
@@ -335,6 +436,39 @@ fn patterns_of_components_place_occurrences() {
     assert!(s.execute("solid.pattern.circular", &json!({"components": ["Nope"], "axis": "Z", "count": 2})).is_err());
 }
 
+/// #4763: a body of a component moved 60 mm along X, patterned from the root. The copy goes
+/// where the pattern puts the body as it is shown (beside it), not where the body sits before
+/// its component is placed (x 10, near the origin).
+#[test]
+fn patterns_of_a_body_in_a_moved_component_follow_its_placement() {
+    for (kind, params, want) in [
+        ("solid.pattern.path", json!({"bodies": ["Pin"], "path_sketch": "Path", "path": ["l1"], "count": 2, "spacing": 10}), [70.0, 0.0]),
+        ("solid.pattern.rectangular", json!({"bodies": ["Pin"], "dir1": [1, 0, 0], "count1": 2, "spacing1": 10}), [70.0, 0.0]),
+        ("solid.pattern.circular", json!({"bodies": ["Pin"], "axis": "Z", "count": 2, "angle": "90 deg"}), [-4.0, 60.0]),
+    ] {
+        let mut s = Session::default();
+        run(&mut s, "component.create", json!({"name": "Screw"}));
+        run(&mut s, "solid.box", json!({"length": 4, "width": 4, "height": 4, "body_name": "Pin"}));
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Path"}));
+        run(&mut s, "sketch.line", json!({"points": [[0, 0], [20, 0]]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "component.activate", json!({"component": "root"}));
+        // The first part is grounded when it is made; this one is moved.
+        run(&mut s, "occurrence.ground", json!({"occurrence": 2, "grounded": false}));
+        run(&mut s, "occurrence.move", json!({"occurrence": 2, "translate": [60, 0, 0]}));
+        run(&mut s, kind, params);
+        let m = run(&mut s, "inspect.measure", json!({}));
+        let bodies = m["bodies"].as_array().unwrap();
+        let at = |name: &str| {
+            let b = bodies.iter().find(|b| b["name"] == name).unwrap_or_else(|| panic!("{kind}: no `{name}` in {m}"));
+            [b["bbox"]["min"][0].as_f64().unwrap(), b["bbox"]["min"][1].as_f64().unwrap()]
+        };
+        assert!((at("Pin")[0] - 60.0).abs() < 1e-6, "{kind}: the source stays at x 60");
+        let copy = at("Pin (2)");
+        assert!((copy[0] - want[0]).abs() < 1e-6 && (copy[1] - want[1]).abs() < 1e-6, "{kind}: the copy is at {copy:?}, want {want:?}");
+    }
+}
+
 #[test]
 fn path_pattern_orientation_follows_the_path() {
     let width_of_copy = |orient: &str| {
@@ -387,23 +521,42 @@ fn patterns_of_a_blind_hole_drill_every_copy() {
     assert!((c - 2.0 * one).abs() < 1e-3 * one, "{c} vs 2 × {one}");
 }
 
-/// Feature patterns and mirrors reference features by name; a rename follows (#401).
+/// Feature patterns and mirrors reference features by id (#1134): a rename leaves the
+/// references alone, and they keep pointing at the same feature (#401).
 #[test]
-fn renaming_a_source_feature_follows_pattern_and_mirror_references() {
+fn renaming_a_source_feature_leaves_pattern_and_mirror_references_alone() {
     let mut s = plate_with_hole();
     run(&mut s, "construct.plane.offset", json!({"base": "YZ", "offset": 0, "name": "Mirror plane"}));
     run(&mut s, "solid.pattern.rectangular", json!({"features": ["Hole1"], "dir1": [1, 0, 0], "count1": 2, "spacing1": 20, "name": "Copies"}));
     run(&mut s, "solid.mirror", json!({"features": ["Hole1"], "plane": "Mirror plane", "name": "Mirrored"}));
+    let hole = s.doc.find_feature("Hole1").unwrap().id;
+    let mirror_plane = s.doc.find_feature("Mirror plane").unwrap().id;
     let renamed = run(&mut s, "timeline.rename", json!({"feature": "Hole1", "name": "Single hole"}));
     assert_eq!(renamed["name"], "Single hole", "{renamed}");
     run(&mut s, "timeline.rename", json!({"feature": "Mirror plane", "name": "Renamed plane"}));
     for feature in ["Copies", "Mirrored"] {
         let inspected = run(&mut s, "timeline.inspect", json!({"feature": feature}));
         assert!(inspected["error"].is_null(), "{feature}: {inspected}");
-        assert_eq!(inspected["definition"]["features"], json!(["Single hole"]), "{inspected}");
+        assert_eq!(inspected["definition"]["features"], json!([hole]), "{inspected}");
     }
     let inspected = run(&mut s, "timeline.inspect", json!({"feature": "Mirrored"}));
-    assert_eq!(inspected["definition"]["plane"]["name"], "Renamed plane", "{inspected}");
+    assert_eq!(inspected["definition"]["plane"], json!({"type": "construction", "feature": mirror_plane}), "{inspected}");
+}
+
+/// timeline.edit keeps accepting seed and plane names as input: they resolve to ids (#1134).
+#[test]
+fn editing_a_pattern_by_seed_name_resolves_it_to_the_id() {
+    let mut s = plate_with_hole();
+    run(&mut s, "solid.pattern.rectangular", json!({"features": ["Hole1"], "dir1": [1, 0, 0], "count1": 2, "spacing1": 20, "name": "Copies"}));
+    run(&mut s, "timeline.rename", json!({"feature": "Hole1", "name": "Single hole"}));
+    run(&mut s, "timeline.edit", json!({"feature": "Copies", "set": {"features": ["Single hole"]}}));
+    let inspected = run(&mut s, "timeline.inspect", json!({"feature": "Copies"}));
+    assert!(inspected["error"].is_null(), "{inspected}");
+    let hole = s.doc.find_feature("Single hole").unwrap().id;
+    assert_eq!(inspected["definition"]["features"], json!([hole]), "{inspected}");
+    // A name that finds no feature is refused, as the commands that take names refuse it.
+    let e = s.execute("timeline.edit", &json!({"feature": "Copies", "set": {"features": ["Nope"]}})).unwrap_err().to_string();
+    assert!(e.contains("Nope"), "{e}");
 }
 
 /// A plate with a `count1` × `count2` feature pattern of one through-hole cut: its volume and how
@@ -804,6 +957,31 @@ fn patterns_and_mirrors_of_patterns_and_mirrors() {
     }
 }
 
+/// A gear's tooth extruded To Object up to the disc's top, patterned 6 times: after the disc is
+/// made twice as thick, every copy reaches the new top like the tooth itself, so the whole part
+/// doubles (#2121). The copies kept the 5 mm height of the face where it was picked.
+#[test]
+fn copies_of_a_to_object_extrude_follow_the_moved_face() {
+    let mut s = Session::default();
+    for (id, p) in [
+        ("sketch.create", json!({"plane":"XY","name":"Disc"})),
+        ("sketch.circle.center", json!({"center":[0,0],"radius":20})),
+        ("sketch.finish", json!({})),
+        ("solid.extrude", json!({"distance":5})),
+        ("sketch.create", json!({"plane":"XY","name":"Tooth"})),
+        ("sketch.rectangle.two_point", json!({"p0":[18,-2],"p1":[24,2]})),
+        ("sketch.finish", json!({})),
+        ("solid.extrude", json!({"sketch":"Tooth","profiles":[0],"to":[0,0,5],"operation":"join"})),
+        ("solid.pattern.circular", json!({"features":["Extrude2"],"axis":"Z","count":6,"angle":"360 deg"})),
+    ] {
+        run(&mut s, id, p);
+    }
+    let thin = volume(&mut s);
+    run(&mut s, "timeline.edit", json!({"feature":"Extrude1","set":{"extent.distance":"10 mm"}}));
+    let thick = volume(&mut s);
+    assert!(rel(thick, 2.0 * thin) < 1e-6, "5 mm: {thin} mm³, 10 mm: {thick} mm³ (expected {})", 2.0 * thin);
+}
+
 /// A disc with an off-centre hole whose top and bottom edges are chamfered.
 fn disc_with_chamfered_hole() -> Session {
     let mut s = Session::default();
@@ -843,4 +1021,137 @@ fn pattern_of_features_picked_in_any_order_copies_them_in_timeline_order() {
         run(&mut s, "solid.pattern.circular", json!({"features": picked, "axis": "Z", "count": 6, "angle": 360}));
         assert!(rel(volume(&mut s), expected) < 1e-9, "{picked:?}");
     }
+}
+
+#[test]
+fn pattern_count_units_explain_how_to_use_a_parameter() -> Result<(), Box<dyn std::error::Error>> {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1, "body_name": "Seed"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Path"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [100, 0]], "ids": ["line"]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "parameters.add", json!({"name": "columns", "expression": "3", "unit": "mm"}));
+    run(&mut s, "parameters.add", json!({"name": "turns", "expression": "3", "unit": "deg"}));
+    for (command, field, params) in [
+        ("solid.pattern.rectangular", "count1", json!({"bodies": ["Seed"], "dir1": [1, 0, 0], "spacing1": 10})),
+        (
+            "solid.pattern.rectangular",
+            "count2",
+            json!({"bodies": ["Seed"], "dir1": [1, 0, 0], "spacing1": 10, "count1": 2, "dir2": [0, 1, 0], "spacing2": 10}),
+        ),
+        ("solid.pattern.circular", "count", json!({"bodies": ["Seed"], "axis": "Z"})),
+        ("solid.pattern.path", "count", json!({"bodies": ["Seed"], "path_sketch": "Path", "path": ["line"], "spacing": 10})),
+    ] {
+        for (expression, message) in [
+            ("columns", "`columns` is a length (mm); set its Unit to none to use it as a count"),
+            ("columns * 2", "this expression is a length (mm)"),
+            ("turns", "`turns` is an angle (deg); set its Unit to none to use it as a count"),
+        ] {
+            let mut params = params.clone();
+            params[field] = json!(expression);
+            let before = s.doc.to_json();
+            let error = s.execute(command, &params).err().ok_or("dimensioned count was accepted")?.to_string();
+            assert!(error.contains(message), "{command} {field}: {error}");
+            assert_eq!(s.doc.to_json(), before);
+        }
+    }
+    Ok(())
+}
+
+/// #9015: in an inch design, pattern spacing `baseLength - 1` subtracts one inch, not one mm.
+#[test]
+fn pattern_spacing_bare_offsets_follow_design_units() {
+    let mut s = Session::default();
+    run(&mut s, "document.units", json!({"units": "in"}));
+    run(&mut s, "parameters.add", json!({"name": "baseLength", "expression": "4"}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Seed"}));
+    run(&mut s, "solid.pattern.rectangular", json!({"bodies": ["Seed"], "dir1": [1, 0, 0], "count1": 2, "spacing1": "baseLength - 1"}));
+    assert_eq!(s.model.state().bodies.len(), 2);
+    // Spacing is 3 in = 76.2 mm (not 3 mm): the seed is 10 in, so the copy starts at x = 76.2.
+    let m = run(&mut s, "inspect.measure", json!({}));
+    let bodies = m["bodies"].as_array().expect("bodies");
+    let xmin = |b: &Value| b["bbox"]["min"][0].as_f64().unwrap_or(0.0);
+    assert!(bodies.iter().any(|b| (xmin(b) - 76.2).abs() < 1e-6), "expected a copy spaced 3 in apart, got {m}");
+}
+
+#[test]
+fn pattern_count_fractions_are_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1, "body_name": "Seed"}));
+    run(&mut s, "parameters.add", json!({"name": "n", "expression": "2.5", "unit": ""}));
+    for expression in [json!(2.5), json!("n"), json!("n * 2 - 2.5")] {
+        let params = json!({"bodies": ["Seed"], "dir1": [1, 0, 0], "count1": expression, "spacing1": 10});
+        let error = s.execute("solid.pattern.rectangular", &params).err().ok_or("fractional count was accepted")?.to_string();
+        assert!(error.contains("a count must be a whole number;"), "{error}");
+        assert!(error.contains("is 2.5"), "{error}");
+        if expression == json!("n") {
+            assert!(error.contains("`n` is 2.5"), "{error}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn pattern_count_integer_parameters_survive_save_and_reject_fractional_edits() -> Result<(), Box<dyn std::error::Error>> {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1, "body_name": "Seed"}));
+    run(&mut s, "parameters.add", json!({"name": "n", "expression": "3", "unit": ""}));
+    run(&mut s, "solid.pattern.rectangular", json!({"bodies": ["Seed"], "dir1": [1, 0, 0], "count1": "n", "spacing1": 10, "name": "Copies"}));
+    assert_eq!(s.model.state().bodies.len(), 3);
+    let mut reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json())?);
+    assert!(reopened.model.results.iter().all(|r| r.error.is_none()));
+    assert_eq!(reopened.model.state().bodies.len(), 3);
+    let error = reopened
+        .execute("timeline.edit", &json!({"feature": "Copies", "set": {"pattern": {"count1": "n / 2"}}}))
+        .err()
+        .ok_or("fractional edit was accepted")?
+        .to_string();
+    assert!(error.contains("a count must be a whole number;"), "{error}");
+    let mut saved = solidcraft_doc::Document::from_json(&s.doc.to_json())?;
+    for feature in &mut saved.features {
+        if let solidcraft_doc::FeatureKind::Pattern { pattern: solidcraft_doc::PatternKind::Rectangular { count1, .. }, .. } = &mut feature.kind {
+            *count1 = "n / 2".into();
+        }
+    }
+    let invalid = Session::new(solidcraft_doc::Document::from_json(&saved.to_json())?);
+    assert!(invalid.model.results.iter().any(|r| r.error.as_ref().is_some_and(|e| e.contains("a count must be a whole number;"))));
+    Ok(())
+}
+
+/// Editing a pattern behind the history marker (double-clicking its greyed-out item and pressing
+/// OK) changes nothing in the model: the reply says so, where the edit used to look as if it had
+/// silently failed, and it still carries what building the copies met (#8100).
+#[test]
+fn editing_a_rolled_back_pattern_says_it_is_not_built() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length":40,"width":30,"height":10,"corner":[0,0,0],"body_name":"Plate"}));
+    run(&mut s, "solid.cylinder", json!({"radius":2,"height":20,"base":[10,15,-5],"operation":"cut","targets":["Plate"],"name":"Cut"}));
+    let pattern = |count: u32, origin: [f64; 3]| json!({"features":["Cut"],"axis":{"origin":origin,"dir":[0,0,1]},"count":count});
+    let redefine = |count, origin| json!({"feature":"Pattern","command":"solid.pattern.circular","params":pattern(count, origin)});
+    let centre = [20.0, 15.0, 0.0];
+    let hole = PI * 4.0 * 10.0;
+    let mut first = pattern(2, centre);
+    first["name"] = json!("Pattern");
+    let id = run(&mut s, "solid.pattern.circular", first)["feature"].as_u64().unwrap();
+    assert!(rel(volume(&mut s), 12000.0 - 2.0 * hole) < 1e-4);
+    // A pattern that is built: the edit is built at once, with nothing to say.
+    let reply = run(&mut s, "timeline.redefine", redefine(3, centre));
+    assert_eq!(reply["rolled_back"], json!(false), "{reply}");
+    assert!(reply.get("note").is_none(), "{reply}");
+    assert!(rel(volume(&mut s), 12000.0 - 3.0 * hole) < 1e-4);
+    // Behind the marker: the edit is kept but not built, and the reply says why nothing changed.
+    run(&mut s, "timeline.roll_to", json!({"position": 2}));
+    let reply = run(&mut s, "timeline.redefine", redefine(4, centre));
+    assert_eq!(reply["rolled_back"], json!(true), "{reply}");
+    assert_eq!(reply["note"], "Pattern is after the history marker, so it is not built: move the marker past it to build it");
+    assert!(reply.get("warning").is_none(), "{reply}");
+    assert!(rel(volume(&mut s), 12000.0 - hole) < 1e-4);
+    assert!(s.model.result(id).is_some_and(|r| r.skipped && r.error.is_none()));
+    run(&mut s, "timeline.roll_to", json!({}));
+    assert!(rel(volume(&mut s), 12000.0 - 4.0 * hole) < 1e-4);
+    // What building the rolled-back copies met still reaches the reply: here a copy that misses.
+    run(&mut s, "timeline.roll_to", json!({"position": 2}));
+    let reply = run(&mut s, "timeline.redefine", redefine(2, [0.0, 0.0, 0.0]));
+    assert_eq!(reply["rolled_back"], json!(true), "{reply}");
+    assert_eq!(reply["warning"], "1 of 1 cut copies remove no material", "{reply}");
 }
