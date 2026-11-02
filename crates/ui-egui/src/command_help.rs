@@ -13,6 +13,7 @@ pub const DOCUMENTED: &[&str] = &[
     "cam.contour",
     "cam.delete_op",
     "cam.pocket",
+    "cam.post",
     "cam.setup",
     "cam.tool",
     "canvas.decal",

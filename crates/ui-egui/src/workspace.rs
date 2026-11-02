@@ -327,6 +327,7 @@ pub const SECTIONS: &[Section] = &[
     // CAM: the cutters and the part in its stock first, then the operations that cut it.
     Section { tab: "MANUFACTURE", panel: "SETUP", promoted: 2, ids: &["cam.tool", "cam.setup"] },
     Section { tab: "MANUFACTURE", panel: "MILLING", promoted: 2, ids: &["cam.contour", "cam.pocket", "cam.delete_op"] },
+    Section { tab: "MANUFACTURE", panel: "POST", promoted: 1, ids: &["cam.post"] },
 ];
 
 // Migration data only: Render commands remain registered, but have no live ribbon sections.

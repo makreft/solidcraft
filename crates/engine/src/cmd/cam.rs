@@ -50,7 +50,7 @@ pub static COMMANDS: &[CommandSpec] = &[
          bounds, too_small?}",
     ),
     CommandSpec::new("cam.delete_op", "Delete CAM Operation", delete_op).at("MANUFACTURE", "MILLING").icon("delete").params("setup; name"),
-    CommandSpec::new("cam.post", "Post Process", post_cmd).icon("post").noundo().params(
+    CommandSpec::new("cam.post", "Post Process", post_cmd).at("MANUFACTURE", "POST").icon("post").noundo().params(
         "setup; post?: rs274 | name of a saved post (default rs274); program?: name (default the setup's); \
          verify?: bool (default true: read the G-code back and check it against the toolpaths); path?: file to write the \
          program to (then the result has `lines` instead of `gcode`) → {gcode | path, lines, extension, post, operations, \
