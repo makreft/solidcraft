@@ -289,6 +289,115 @@ fn dogbones_reach_into_the_inside_corners() {
     close(dist_to_cuts(&plain, -5.9, v(0.0, 0.0)), 3.0 * 2f64.sqrt(), 1e-6);
 }
 
+/// A bend of the offset that is no corner of the part (two parts, or an island and a wall, closer
+/// than the tool) gets no notch: it would cut into one of them.
+#[test]
+fn dogbones_stay_out_of_parts_closer_than_the_tool() {
+    let tight = |path: &Toolpath, shape: &Shape, skip: &[(f64, f64)]| {
+        cutting_points(path, -0.1)
+            .into_iter()
+            .map(|p| v(p.x, p.y))
+            .filter(|q| skip.iter().all(|&(x, y)| q.dist(v(x, y)) > 3.5))
+            .map(|q| shape.dist(q))
+            .fold(f64::INFINITY, f64::min)
+    };
+    // Two 20 × 20 parts 4 mm apart, cut round the outside with a 6 mm tool: the offsets of their
+    // facing sides cross in the gap, where no wall corner is.
+    let parts = [rect(0.0, 0.0, 20.0, 20.0), rect(24.0, 0.0, 44.0, 20.0)];
+    let shape = Shape::from_regions(&parts, 0.01).unwrap();
+    let c = cut(0.0, -6.0, 6.0);
+    let params =
+        ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones: true };
+    let with = contour(&parts, &tool(6.0), &params, &c).unwrap();
+    assert!(tight(&with, &shape, &[]) >= 3.0 - 0.006, "{}", tight(&with, &shape, &[]));
+    let plain = contour(&parts, &tool(6.0), &ContourParams { dogbones: false, ..params }, &c).unwrap();
+    close(with.stats().cut_length, plain.stats().cut_length, 1e-9);
+
+    // A 50 × 30 pocket with an island 4 mm from its lower wall: the pocket's own corners are
+    // notched, nothing cuts into the island or the wall beside it.
+    let housing = [Region2 { outer: rect(0.0, 0.0, 50.0, 30.0).outer, holes: vec![rect(10.0, 4.0, 40.0, 20.0).outer.reversed()] }];
+    let shape = Shape::from_regions(&housing, 0.01).unwrap();
+    let pp = PocketParams { stepover: 2.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: true };
+    let pocketed = pocket(&housing, &tool(6.0), &pp, &cut(0.0, -6.0, 3.0)).unwrap();
+    let corners = [(0.0, 0.0), (50.0, 0.0), (50.0, 30.0), (0.0, 30.0)];
+    assert!(tight(&pocketed, &shape, &corners) >= 3.0 - 0.006, "{}", tight(&pocketed, &shape, &corners));
+    for (x, y) in corners {
+        close(dist_to_cuts(&pocketed, -5.9, v(x, y)), 3.0, 1e-6);
+    }
+}
+
+/// The length the last pass runs at the tabs' height, and its longest stretch there.
+fn on_tabs(path: &Toolpath, top: f64) -> (f64, f64) {
+    let pts = path.points(0.005);
+    let (mut total, mut run, mut longest) = (0.0, 0.0, 0.0f64);
+    for w in pts.windows(2) {
+        let (a, b) = (w[0].0, w[1].0);
+        if w[1].1 && (a.z - top).abs() < 1e-6 && (b.z - top).abs() < 1e-6 {
+            let d = Vec2::new(a.x, a.y).dist(Vec2::new(b.x, b.y));
+            total += d;
+            run += d;
+            longest = longest.max(run);
+        } else {
+            run = 0.0;
+        }
+    }
+    (total, longest)
+}
+
+/// Between two tabs on one side, or on one arc, the tool goes back down to depth: it stays at the
+/// tabs' height only over each tab, the tab's width plus the tool's.
+#[test]
+fn tabs_on_one_side_let_the_cut_through_between_them() {
+    let tabs = |spacing| Tabs { width: 6.0, height: 2.0, spacing, inner: false };
+    // A 200 × 20 strip (the loop about 459 mm, so ten tabs) and a disc of radius 50 (the loop
+    // about 333 mm, so four).
+    for (part, spacing, count) in
+        [(rect(0.0, 0.0, 200.0, 20.0), 50.0, 10.0), (Region2 { outer: Loop2::circle(v(0.0, 0.0), 50.0), holes: vec![] }, 100.0, 4.0)]
+    {
+        for ramp in [0.0, 3f64.to_radians()] {
+            let params = ContourParams {
+                side: Side::Outside,
+                climb: true,
+                stock_to_leave: 0.0,
+                tolerance: 0.01,
+                ramp_angle: ramp,
+                tabs: Some(tabs(spacing)),
+                dogbones: false,
+            };
+            let path = contour(std::slice::from_ref(&part), &tool(6.0), &params, &cut(0.0, -6.0, 3.0)).unwrap();
+            let (total, longest) = on_tabs(&path, -4.0);
+            assert!(longest <= 12.0 + 1e-3, "spacing {spacing}, ramp {ramp}: {longest} mm on end at the tabs' height");
+            if ramp == 0.0 {
+                close(total, count * 12.0, 0.01);
+            }
+            // Most of the loop is cut at full depth on the last pass.
+            let deep: f64 = path
+                .points(0.005)
+                .windows(2)
+                .filter(|w| w[1].1 && (w[0].0.z + 6.0).abs() < 1e-6 && (w[1].0.z + 6.0).abs() < 1e-6)
+                .map(|w| Vec2::new(w[0].0.x, w[0].0.y).dist(Vec2::new(w[1].0.x, w[1].0.y)))
+                .sum();
+            let loop_length = if spacing == 50.0 { 440.0 + 6.0 * PI } else { 2.0 * PI * 53.0 };
+            // Each tab takes its flat and the two 45° slopes off the loop (arcs sampled as chords).
+            assert!(deep >= loop_length - count * (12.0 + 4.0) - 0.05, "spacing {spacing}, ramp {ramp}: {deep} mm at depth");
+        }
+    }
+}
+
+/// A cut deeper than the tool's cutting edges is refused: the shank would rub in the slot.
+#[test]
+fn a_cut_deeper_than_the_flutes_is_refused() {
+    let short = Tool::new(4, ToolKind::FlatEndmill, 3.0, 8.0);
+    let part = [rect(0.0, 0.0, 40.0, 30.0)];
+    let cp = ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones: false };
+    let pp = PocketParams { stepover: 1.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false };
+    let deep = cut(0.0, -12.0, 3.0);
+    for err in [contour(&part, &short, &cp, &deep).unwrap_err(), pocket(&part, &short, &pp, &deep).unwrap_err()] {
+        assert!(err.to_string().contains("flute length"), "{err}");
+    }
+    assert!(contour(&part, &short, &cp, &cut(0.0, -8.0, 4.0)).is_ok());
+}
+
 /// Where the tool rises onto a tab: the moves that end at the tabs' top coming from below it.
 fn tab_rises(path: &Toolpath, top: f64) -> Vec<Vec3> {
     let pts = path.points(0.005);
@@ -517,8 +626,8 @@ T3 M6
 G43 H3
 S3000 M3
 M8
-G0 X10 Y10
 G0 Z10
+G0 X10 Y10
 G0 Z2
 G1 Z-10 F200
 G4 P0.25

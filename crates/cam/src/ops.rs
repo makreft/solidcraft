@@ -26,6 +26,8 @@ const MAX_TABS: usize = 1000;
 /// A corner of the toolpath that turns away from the material by more than this (radians) gets
 /// a dogbone; the slight bends of a curve drawn as short lines do not.
 const DOGBONE_MIN_TURN: f64 = 0.5;
+/// The steepest ramp into the material (85°).
+const RAMP_LIMIT: f64 = 85.0 * PI / 180.0;
 
 /// The Z levels of an operation (work coordinates, mm).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -272,7 +274,7 @@ impl Builder {
         for piece in lp {
             let len = piece.length();
             let s1 = s0 + len;
-            let mut at: Vec<f64> = tabs.flats.iter().flat_map(|&(a, b)| [a, b]).filter(|&k| k > s0 && k < s1).collect();
+            let mut at: Vec<f64> = tabs.kinks().into_iter().filter(|&k| k > s0 && k < s1).collect();
             at.extend([s0, s1]);
             at.sort_by(f64::total_cmp);
             let crossings: Vec<f64> = at
@@ -349,7 +351,16 @@ impl Builder {
 }
 
 fn check_ramp(angle: f64) -> Result<()> {
-    if (0.0..=1.5).contains(&angle) { Ok(()) } else { invalid("the ramp angle must be between 0 and 85 degrees") }
+    if (0.0..=RAMP_LIMIT).contains(&angle) { Ok(()) } else { invalid("the ramp angle must be between 0 and 85 degrees") }
+}
+
+/// A cut deeper than the tool's cutting edges would rub its shank in the slot.
+fn check_reach(tool: &Tool, cut: &Cut) -> Result<()> {
+    let depth = cut.heights.top - cut.heights.bottom;
+    if depth > tool.flute_length + 1e-9 {
+        return invalid(format!("the cut is {depth:.3} mm deep, but tool {} cuts only {:.3} mm (its flute length)", tool.number, tool.flute_length));
+    }
+    Ok(())
 }
 
 fn check_leave(leave: f64) -> Result<()> {
@@ -373,6 +384,7 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
     tool.validate()?;
     mills(tool)?;
     cut.validate()?;
+    check_reach(tool, cut)?;
     check_leave(params.stock_to_leave)?;
     check_ramp(params.ramp_angle)?;
     if let Some(t) = &params.tabs {
@@ -402,7 +414,7 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
         let material_left = params.side == Side::Outside;
         let lp = match params.side {
             Side::On => natural.clone(),
-            _ if params.dogbones => with_dogbones(natural, away, material_left),
+            _ if params.dogbones => with_dogbones(natural, away, material_left, &shape),
             _ => natural.clone(),
         };
         let lp = if params.climb == natural_is_climb { lp } else { reversed(&lp) };
@@ -429,8 +441,11 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
 
 /// `lp` with a dogbone at every corner where it turns away from the material: out along the
 /// corner's bisector until the tool, `away` from the wall, is that far from the corner too, and
-/// back. Very sharp corners (where that would reach out more than four times `away`) are left.
-fn with_dogbones(lp: &[Piece], away: f64, material_left: bool) -> Vec<Piece> {
+/// back. Very sharp corners (where that would reach out more than four times `away`) are left,
+/// and so is a bend that is no corner of `shape`: where the offsets of two walls that do not
+/// meet cross (two parts, or an island and a wall, closer than the tool), a notch would cut
+/// into one of them.
+fn with_dogbones(lp: &[Piece], away: f64, material_left: bool, shape: &Shape) -> Vec<Piece> {
     let free = |t: Vec2| if material_left { -t.perp() } else { t.perp() };
     let mut out = Vec::with_capacity(lp.len() * 2);
     for (piece, next) in lp.iter().zip(lp.iter().cycle().skip(1)) {
@@ -451,10 +466,24 @@ fn with_dogbones(lp: &[Piece], away: f64, material_left: bool) -> Vec<Piece> {
         let (Some(dir), true) = (x.normalized(), reach > 1e-6 && reach <= 4.0 * away) else { continue };
         let c = piece.end();
         let tip = c - dir * reach;
+        if !is_wall_corner(shape, c - x, c, tip, away) {
+            continue;
+        }
         out.push(Piece::Line { a: c, b: tip });
         out.push(Piece::Line { a: tip, b: c });
     }
     out
+}
+
+/// Whether `corner` is where two walls of `shape` meet, and the notch from `c` out to `tip` stays
+/// `away` from every other wall: only the walls through the corner may come closer.
+fn is_wall_corner(shape: &Shape, corner: Vec2, c: Vec2, tip: Vec2, away: f64) -> bool {
+    const ON: f64 = 1e-6;
+    if !(shape.dist(corner) <= ON) {
+        return false;
+    }
+    let others = || shape.loops().iter().flatten().filter(|w| !(w.dist(corner) <= ON));
+    (0..=8).map(|k| c + (tip - c) * (k as f64 / 8.0)).all(|q| others().all(|w| w.dist(q) >= away - ON))
 }
 
 /// The tabs of one loop: stretches (arc length from the loop's start) where the tool stays at
@@ -465,6 +494,17 @@ struct Terrain {
 }
 
 impl Terrain {
+    /// Where the floor bends: the ends of every tab's flat, and the middle between two tabs where
+    /// the ramp down from one meets the ramp up to the next. Between two of them the floor is
+    /// straight, so a pass's depth crosses it at most once.
+    fn kinks(&self) -> Vec<f64> {
+        let mut flats = self.flats.clone();
+        flats.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let mut out: Vec<f64> = flats.iter().flat_map(|&(a, b)| [a, b]).collect();
+        out.extend(flats.windows(2).map(|w| (w[0].1 + w[1].0) / 2.0));
+        out
+    }
+
     /// The lowest the tool may go at `s` along the loop.
     fn floor(&self, s: f64) -> f64 {
         self.flats.iter().map(|&(a, b)| self.top - (a - s).max(s - b).max(0.0)).fold(f64::NEG_INFINITY, f64::max)
@@ -554,6 +594,7 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
     tool.validate()?;
     mills(tool)?;
     cut.validate()?;
+    check_reach(tool, cut)?;
     check_leave(params.stock_to_leave)?;
     check_ramp(params.ramp_angle)?;
     let r = tool.radius();
@@ -601,7 +642,7 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
     if params.dogbones
         && let Some(walls) = rings.first_mut()
     {
-        *walls = walls.iter().map(|lp| with_dogbones(lp, wall, false)).collect();
+        *walls = walls.iter().map(|lp| with_dogbones(lp, wall, false, &shape)).collect();
     }
     let mut b = Builder::new(cut);
     // The depth already cut wherever this pass's rings run.

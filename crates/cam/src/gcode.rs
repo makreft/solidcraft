@@ -158,8 +158,10 @@ impl Writer<'_> {
     }
 
     fn rapid(&mut self, to: Vec3) {
-        // Never a diagonal rapid: up first when rising, across first when descending.
-        if self.pos.is_some_and(|p| to.z > p.z) {
+        // Never a diagonal rapid: up first when rising, across first when descending. Where the
+        // tool is not known (the program's start, after a tool change) it may stand just above
+        // the stock or a clamp: up first.
+        if self.pos.is_none_or(|p| to.z > p.z) {
             self.linear(0, to, false, true, None);
             self.linear(0, to, true, false, None);
         } else {
