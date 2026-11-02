@@ -513,6 +513,12 @@ fn permissions_section(app: &mut SolveApp, ui: &mut egui::Ui) {
             ui_kit::text(ui, tr("ui.ai_mode_all_warning"), ui_kit::Text::Report("permissions_warning", true));
         }
         ui_kit::text(ui, tr("ai.prefs.permission_scope"), ui_kit::Text::Hint("scope")).on_hover_text(tr("ui.ai_modes_scope"));
+        let r = ui_kit::checkbox(ui, tr("ui.ai_computer_access"), &mut app.preferences.agent_computer_access)
+            .on_hover_text(tr("ui.ai_computer_access_note"));
+        crate::scenario::publish_handle("prefs:ai_computer_access", r.rect.center());
+        if app.preferences.agent_computer_access && app.preferences.ai_permissions == Mode::All {
+            ui_kit::text(ui, tr("ui.ai_computer_access_warning"), ui_kit::Text::Report("computer_access_warning", true));
+        }
         let remembered: Vec<_> = app
             .preferences
             .agent_always_allow
@@ -554,6 +560,18 @@ fn panel_section(app: &mut SolveApp, ui: &mut egui::Ui) {
                         p.agent_chat_side = if selected == 0 { "left" } else { "right" }.into();
                     }
                 }
+            });
+            ui_kit::row(ui, tr("ui.agent_chat_text_size"), |ui| {
+                let mut scale = super::panel::text_scale(app.preferences.agent_chat_text_scale);
+                let r = ui_kit::slider(
+                    ui,
+                    &mut scale,
+                    super::panel::TEXT_SCALE,
+                    ui_kit::Slider { step: Some(0.05), format: |v| format!("{:.0} %", v * 100.0), ..Default::default() },
+                )
+                .on_hover_text(tr("ui.agent_chat_text_size_note"));
+                crate::scenario::publish_handle("prefs:agent_chat_text_size", r.rect.center());
+                app.preferences.agent_chat_text_scale = scale;
             });
             ui_kit::row(ui, tr("ui.agent_chat_turn_limit"), |ui| {
                 let p = &mut app.preferences;

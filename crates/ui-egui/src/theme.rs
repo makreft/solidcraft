@@ -30,6 +30,9 @@ thread_local! {
     /// The application bar's logo in the theme's accent instead of its own logo colours
     /// (Preferences › Interface › Logo), per thread like the rest.
     static LOGO_ACCENT: Cell<bool> = const { Cell::new(false) };
+    /// A factor on every font size while one part of the window is drawn ([`with_text_scale`]),
+    /// per thread like the rest. 1 everywhere else.
+    static TEXT_SCALE: Cell<f32> = const { Cell::new(1.0) };
     /// The 3D view's own dark or light when Preferences give it one ([`ViewportTheme`], #4146),
     /// per thread like the rest. `None`: the view is as dark as the window.
     static VIEWPORT_DARK: Cell<Option<bool>> = const { Cell::new(None) };
@@ -328,6 +331,19 @@ impl TabThemeState {
         let tab_surfaces = self.prepared.as_ref().is_some_and(|p| p.enabled && !p.file.tabs.is_empty());
         (PublishedTab { environment, tokens, view, tab_surfaces }, target.accent, self.fade.is_some())
     }
+}
+
+/// Draw with every font size of [`Tokens::get`] times `scale` (the agent chat's text size); the
+/// previous factor comes back afterwards, also when `draw` panics.
+pub fn with_text_scale<R>(scale: f32, draw: impl FnOnce() -> R) -> R {
+    struct Restore(f32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEXT_SCALE.set(self.0);
+        }
+    }
+    let _restore = Restore(TEXT_SCALE.replace(scale));
+    draw()
 }
 
 /// Three structural border levels plus independent content and control outlines.
@@ -1292,7 +1308,36 @@ impl Tokens {
     /// The tokens of the current theme and colour vision mode, the colours drawn in the 3D view
     /// from the view's own dark or light ([`viewport_dark`]).
     pub fn get() -> Tokens {
-        Tokens::get_in(vision())
+        Tokens::get_in(vision()).text_scaled(TEXT_SCALE.get())
+    }
+
+    /// These tokens with every font size times `scale`.
+    pub fn text_scaled(self, scale: f32) -> Tokens {
+        if scale == 1.0 {
+            return self;
+        }
+        let mut t = self;
+        for size in [
+            &mut t.font_badge,
+            &mut t.font_micro,
+            &mut t.font_panel,
+            &mut t.font_small,
+            &mut t.font_caption,
+            &mut t.font_body,
+            &mut t.font_label,
+            &mut t.font_button,
+            &mut t.font_heading,
+            &mut t.font_triad,
+            &mut t.font_compass,
+            &mut t.font_subtitle,
+            &mut t.font_intro,
+            &mut t.font_article_heading,
+            &mut t.font_title,
+            &mut t.font_display,
+        ] {
+            *size *= scale;
+        }
+        t
     }
 
     /// [`Tokens::get`] in another colour vision mode: the Colour vision preference previews the
@@ -1735,6 +1780,26 @@ mod tests {
             frame.tokens,
             crate::theme_files::resolve_for_tab(&instant.prepared.as_ref().unwrap().file, &instant.prepared.as_ref().unwrap().values, Some("SKETCH"))
         );
+    }
+
+    /// The agent chat's text size: every font size grows while its part is drawn, nothing else
+    /// does, and the usual sizes come back afterwards, also after a nested scale or a panic.
+    #[test]
+    fn a_text_scale_holds_only_while_its_part_is_drawn() {
+        let normal = super::Tokens::get();
+        let inside = super::with_text_scale(1.5, || {
+            let t = super::Tokens::get();
+            assert_eq!(super::with_text_scale(2.0, || super::Tokens::get().font_body), normal.font_body * 2.0);
+            assert_eq!(super::Tokens::get().font_body, normal.font_body * 1.5);
+            t
+        });
+        assert_eq!(inside.font_body, normal.font_body * 1.5);
+        assert_eq!(inside.font_article_heading, normal.font_article_heading * 1.5);
+        assert_eq!(inside.font_caption, normal.font_caption * 1.5);
+        assert_eq!((inside.space_8, inside.control_height), (normal.space_8, normal.control_height), "only text grows");
+        assert_eq!(super::Tokens::get().font_body, normal.font_body);
+        let _ = std::panic::catch_unwind(|| super::with_text_scale(3.0, || panic!("drawing failed")));
+        assert_eq!(super::Tokens::get().font_body, normal.font_body, "a panic leaves the usual sizes");
     }
 
     #[test]

@@ -10,6 +10,12 @@ use crate::i18n;
 pub const DOCUMENTED: &[&str] = &[
     "appearance.assign",
     "assembly.bom",
+    "cam.contour",
+    "cam.delete_op",
+    "cam.pocket",
+    "cam.post",
+    "cam.setup",
+    "cam.tool",
     "canvas.decal",
     "canvas.edit",
     "canvas.insert",

@@ -52,3 +52,10 @@ bom = "list"
 # Render workspace drafts: shared meanings; owner review remains Open.
 # Removing a look override returns the body to its material look.
 render_remove_override = "render_from_material"
+
+# CAM (MANUFACTURE) commands draw finished artwork that reads as their operation.
+tool = "thread"           # a fluted cutter
+setup = "bounding_solid"  # the part in its stock
+contour = "offset"        # a path along the outline
+pocket = "hole"           # a recess cleared from a block
+post = "export"           # the NC program written out

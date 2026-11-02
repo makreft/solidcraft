@@ -176,7 +176,8 @@ pub fn is_bridge_tool(title: &str, kind: Option<&str>) -> bool {
 /// The MCP server the agent starts to reach the design: `solidcraft-cli mcp --connect` bridged to
 /// this app's control port. The server finds the port's token in the token file the app wrote
 /// (docs/control-protocol.md), so the token never travels through the agent, and it keeps its
-/// default folder limits (docs/mcp.md): no `--allow-any-path`.
+/// default folder limits (docs/mcp.md) unless the user lets the agent use the computer
+/// (`agent_computer_access`): then `--allow-any-path`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpBridge {
     pub cli: std::path::PathBuf,
@@ -184,11 +185,15 @@ pub struct McpBridge {
 }
 
 impl McpBridge {
-    pub fn to_json(&self) -> Value {
+    pub fn to_json(&self, any_path: bool) -> Value {
+        let mut args = vec!["mcp".to_string(), "--connect".to_string(), format!("127.0.0.1:{}", self.port)];
+        if any_path {
+            args.push("--allow-any-path".into());
+        }
         json!({
             "name": BRIDGE_NAME,
             "command": self.cli.to_string_lossy(),
-            "args": ["mcp", "--connect", format!("127.0.0.1:{}", self.port)],
+            "args": args,
             "env": [],
         })
     }
@@ -224,16 +229,30 @@ pub fn wsl_path(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// What every session is told about where it is. An agent with no route for it in
-/// [`session_new_params`] doesn't get it.
-pub const SYSTEM_NOTE: &str = "You are running inside SolidCraft, a parametric 3D CAD application, as the user's assistant. \
+/// Where the agent is and how it reaches the design: the start of every session's note.
+macro_rules! design_note {
+    () => {
+        "You are running inside SolidCraft, a parametric 3D CAD application, as the user's assistant. \
 The open design is reachable through the `solidcraft-app` MCP server: use its tools (list_commands, batch, execute, inspect_design, \
 measure, screenshot, set_parameter, undo, skill_reference) to read and change the design the user is looking at, and verify with \
 measure or inspect_design. Before building anything beyond one primitive, read `skill_reference` for `solidcraft-modeling` (its \
 SKILL.md has the workflow, its reference.md the command shapes and this version's traps), work the numbers out first, and after \
 each stage compare `measure` with them. Prefer one `batch` over many small calls. Saving, opening or exporting files waits for the user's approval in \
-the chat, and each message allows a limited number of changes. Don't use shell or file tools: work through the SolidCraft tools. \
-Keep answers short.";
+the chat, and each message allows a limited number of changes."
+    };
+}
+
+/// What every session is told about where it is. An agent with no route for it in
+/// [`session_new_params`] doesn't get it.
+pub const SYSTEM_NOTE: &str = concat!(design_note!(), " Don't use shell or file tools: work through the SolidCraft tools. Keep answers short.");
+
+/// The note when the user lets the agent use the computer (`agent_computer_access`).
+pub const SYSTEM_NOTE_COMPUTER: &str = concat!(
+    design_note!(),
+    " The user has also given you this computer: your own shell, file and web tools are on, and SolidCraft's file \
+commands reach any folder. Change the open design only through the SolidCraft tools, never by editing its file. \
+Keep answers short."
+);
 
 /// The Claude Code adapter's own tools that reach the computer rather than the design: turned off
 /// for the session (`_meta.claudeCode.options.disallowedTools`), so it works through SolidCraft's.
@@ -242,20 +261,23 @@ pub const CLAUDE_DISALLOWED_TOOLS: &[&str] =
 
 /// The `session/new` parameters. `init` is the agent's `initialize` reply: agents read the system
 /// note from different places (#9811), and the standard field may only go to an agent offering it.
-pub fn session_new_params(cwd: &std::path::Path, bridge: Option<&McpBridge>, init: &Value) -> Value {
-    let servers: Vec<Value> = bridge.map(McpBridge::to_json).into_iter().collect();
+/// `computer`: the user lets the agent use the computer (`agent_computer_access`), so its own
+/// tools stay on and the bridge has no folder limits.
+pub fn session_new_params(cwd: &std::path::Path, bridge: Option<&McpBridge>, init: &Value, computer: bool) -> Value {
+    let servers: Vec<Value> = bridge.map(|b| b.to_json(computer)).into_iter().collect();
+    let (note, disallowed) = if computer { (SYSTEM_NOTE_COMPUTER, &[][..]) } else { (SYSTEM_NOTE, CLAUDE_DISALLOWED_TOOLS) };
     let mut meta = json!({
         // The Claude adapter's own key, for its versions without the standard field.
-        "systemPrompt": {"append": SYSTEM_NOTE},
+        "systemPrompt": {"append": note},
         // Hosts may opt a session out of "bypass permissions" (the Claude adapter reads it):
         // every tool call the agent asks about reaches the panel.
-        // Its own shell and file tools are off: the agent works through SolidCraft's tools.
-        "claudeCode": {"options": {"allowDangerouslySkipPermissions": false, "disallowedTools": CLAUDE_DISALLOWED_TOOLS}},
+        // Its own shell and file tools are off unless the user lets it use the computer.
+        "claudeCode": {"options": {"allowDangerouslySkipPermissions": false, "disallowedTools": disallowed}},
     });
     if takes_antigravity_note(init)
         && let Some(meta) = meta.as_object_mut()
     {
-        meta.insert("antigravity".into(), json!({"systemPrompt": {"append": SYSTEM_NOTE}}));
+        meta.insert("antigravity".into(), json!({"systemPrompt": {"append": note}}));
     }
     let mut params = json!({
         "cwd": cwd.to_string_lossy(),
@@ -265,7 +287,7 @@ pub fn session_new_params(cwd: &std::path::Path, bridge: Option<&McpBridge>, ini
     if takes_standard_note(init)
         && let Some(params) = params.as_object_mut()
     {
-        params.insert("systemPrompt".into(), json!({"mode": "append", "content": [{"type": "text", "text": SYSTEM_NOTE}]}));
+        params.insert("systemPrompt".into(), json!({"mode": "append", "content": [{"type": "text", "text": note}]}));
     }
     params
 }
@@ -763,21 +785,21 @@ mod tests {
     #[test]
     fn the_session_gets_the_bridged_mcp_server_without_a_token_or_any_path() {
         let b = McpBridge { cli: "/opt/solidcraft/solidcraft-cli".into(), port: 41234 };
-        let p = session_new_params(std::path::Path::new("/home/u/designs"), Some(&b), &json!({}));
+        let p = session_new_params(std::path::Path::new("/home/u/designs"), Some(&b), &json!({}), false);
         let s = &p["mcpServers"][0];
         assert_eq!(s["name"], BRIDGE_NAME);
         assert_eq!(s["args"], json!(["mcp", "--connect", "127.0.0.1:41234"]));
         let text = p.to_string();
         assert!(!text.contains("allow-any-path") && !text.contains("TOKEN") && !text.contains("token"), "{text}");
         assert!(p["_meta"]["claudeCode"]["options"]["disallowedTools"].as_array().is_some_and(|t| t.iter().any(|x| x == "Bash")));
-        assert_eq!(session_new_params(std::path::Path::new("/tmp"), None, &json!({}))["mcpServers"], json!([]));
+        assert_eq!(session_new_params(std::path::Path::new("/tmp"), None, &json!({}), false)["mcpServers"], json!([]));
     }
 
     /// #9811: the note goes by the routes an agent's `initialize` reply offers, and the standard
     /// field never goes to an agent that doesn't offer it, as the protocol asks.
     #[test]
     fn the_system_note_takes_every_route_the_agent_offers() {
-        let params = |init: Value| session_new_params(std::path::Path::new("/tmp"), None, &init);
+        let params = |init: Value| session_new_params(std::path::Path::new("/tmp"), None, &init, false);
         let standard = json!({"mode": "append", "content": [{"type": "text", "text": SYSTEM_NOTE}]});
 
         let offers_standard = params(json!({"agentCapabilities": {"sessionCapabilities": {"systemPrompt": {}}}}));
@@ -806,6 +828,24 @@ mod tests {
         }
     }
 
+    /// The user lets the agent use the computer: its own tools stay on, the note says so, and the
+    /// bridge reaches any folder (still without the token).
+    #[test]
+    fn a_session_with_the_computer_keeps_the_agents_tools_and_lifts_the_folder_limits() {
+        let b = McpBridge { cli: "/opt/solidcraft/solidcraft-cli".into(), port: 41234 };
+        let p = session_new_params(std::path::Path::new("/home/u"), Some(&b), &json!({}), true);
+        assert_eq!(p["mcpServers"][0]["args"], json!(["mcp", "--connect", "127.0.0.1:41234", "--allow-any-path"]));
+        assert_eq!(p["_meta"]["claudeCode"]["options"]["disallowedTools"], json!([]));
+        assert_eq!(p["_meta"]["claudeCode"]["options"]["allowDangerouslySkipPermissions"], false);
+        assert_eq!(p["_meta"]["systemPrompt"]["append"], SYSTEM_NOTE_COMPUTER);
+        assert!(!p.to_string().contains("TOKEN") && !p.to_string().contains("token"));
+        for note in [SYSTEM_NOTE, SYSTEM_NOTE_COMPUTER] {
+            assert!(note.starts_with("You are running inside SolidCraft") && note.ends_with("Keep answers short."), "{note}");
+            assert!(note.contains(&format!("`{BRIDGE_NAME}` MCP server")));
+        }
+        assert!(!SYSTEM_NOTE_COMPUTER.contains("Don't use shell"));
+    }
+
     /// #5546: an agent started through `wsl.exe` gets the session's paths as WSL shows them.
     #[test]
     fn an_agent_inside_wsl_gets_wsl_paths() {
@@ -826,7 +866,7 @@ mod tests {
         assert_eq!(wsl(r"\\server\share\x"), r"\\server\share\x");
 
         let b = McpBridge { cli: r"C:\Program Files\SolidCraft\solidcraft-cli.exe".into(), port: 41234 };
-        let p = session_new_params(&wsl_path(std::path::Path::new(r"C:\Users\u\work")), Some(&b.in_wsl()), &json!({}));
+        let p = session_new_params(&wsl_path(std::path::Path::new(r"C:\Users\u\work")), Some(&b.in_wsl()), &json!({}), false);
         assert_eq!(p["cwd"], "/mnt/c/Users/u/work");
         assert_eq!(p["mcpServers"][0]["command"], "/mnt/c/Program Files/SolidCraft/solidcraft-cli.exe");
         assert_eq!(p["mcpServers"][0]["args"], json!(["mcp", "--connect", "127.0.0.1:41234"]));

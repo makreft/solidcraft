@@ -35,6 +35,9 @@ pub struct AcpBackend {
     bridge: Option<acp::McpBridge>,
     /// The agent's `initialize` reply: which routes the system note can take into a session.
     init: Value,
+    computer: bool,
+    /// Started through wsl.exe: folders are handed over as WSL shows them (#5546).
+    wsl: bool,
     next_id: u64,
     pending: HashMap<u64, Pending>,
     session: Option<String>,
@@ -57,13 +60,15 @@ impl AcpBackend {
         let wake = ctx.wake;
         let proc = AgentProcess::spawn(argv, &ctx.cwd, ENV_REMOVE, wake)?;
         // An agent inside WSL is told the same folder and bridge as WSL shows them (#5546).
-        let (cwd, bridge) =
-            if acp::runs_in_wsl(argv) { (acp::wsl_path(&ctx.cwd), ctx.bridge.as_ref().map(acp::McpBridge::in_wsl)) } else { (ctx.cwd, ctx.bridge) };
+        let wsl = acp::runs_in_wsl(argv);
+        let (cwd, bridge) = if wsl { (acp::wsl_path(&ctx.cwd), ctx.bridge.as_ref().map(acp::McpBridge::in_wsl)) } else { (ctx.cwd, ctx.bridge) };
         let mut b = AcpBackend {
             proc,
             cwd,
             bridge,
             init: Value::Null,
+            computer: ctx.computer,
+            wsl,
             next_id: 0,
             pending: HashMap::new(),
             session: None,
@@ -91,7 +96,7 @@ impl AcpBackend {
     fn new_session(&mut self) {
         self.config_pending = None;
         self.pending.retain(|_, request| *request != Pending::SetConfig);
-        let params = acp::session_new_params(&self.cwd, self.bridge.as_ref(), &self.init);
+        let params = acp::session_new_params(&self.cwd, self.bridge.as_ref(), &self.init, self.computer);
         self.request(Pending::SessionNew, "session/new", params);
     }
 
@@ -288,6 +293,11 @@ impl ChatBackend for AcpBackend {
         self.new_session();
     }
 
+    fn set_computer(&mut self, computer: bool, cwd: &std::path::Path) {
+        self.computer = computer;
+        self.cwd = if self.wsl { acp::wsl_path(cwd) } else { cwd.to_path_buf() };
+    }
+
     fn answer_permission(&mut self, key: u64, option: Option<&str>) {
         if let Some(rpc) = self.permissions.remove(&key) {
             self.proc.send(&acp::permission_reply(rpc, option));
@@ -362,7 +372,7 @@ pub fn test_agent(argv: &[String], cwd: &std::path::Path) -> Result<String, Test
     let init = wait_for(&p, 1);
     let session_cwd = if acp::runs_in_wsl(argv) { acp::wsl_path(cwd) } else { cwd.to_path_buf() };
     let result = init.and_then(|v| {
-        p.send(&acp::request(2, "session/new", acp::session_new_params(&session_cwd, None, &v)));
+        p.send(&acp::request(2, "session/new", acp::session_new_params(&session_cwd, None, &v, false)));
         wait_for(&p, 2).map(|_| {
             let who = acp::agent_info(&v);
             crate::i18n::format("ui.ai_test_acp_ok", &[("agent", if who.is_empty() { "?" } else { &who })])
@@ -378,7 +388,7 @@ mod tests {
     use crate::agent_chat::backend::StartContext;
 
     fn ready_backend() -> Result<AcpBackend, String> {
-        let ctx = StartContext { cwd: std::env::temp_dir(), bridge: None, tools: None, wake: Box::new(|| {}) };
+        let ctx = StartContext { cwd: std::env::temp_dir(), bridge: None, computer: false, tools: None, wake: Box::new(|| {}) };
         let mut backend = AcpBackend::start(&["sh".into(), "-c".into(), "cat >/dev/null".into()], ctx)?;
         let mut events = Vec::new();
         backend.handle(Incoming::Reply { id: 1, result: Ok(json!({"agentInfo":{"name":"fake"}})) }, &mut events);
@@ -452,7 +462,7 @@ mod tests {
 
     #[test]
     fn config_updates_and_replies_are_isolated_to_the_active_session() {
-        let ctx = StartContext { cwd: std::env::temp_dir(), bridge: None, tools: None, wake: Box::new(|| {}) };
+        let ctx = StartContext { cwd: std::env::temp_dir(), bridge: None, computer: false, tools: None, wake: Box::new(|| {}) };
         let mut backend = AcpBackend::start(&["sh".into(), "-c".into(), "cat >/dev/null".into()], ctx).unwrap();
         let mut events = Vec::new();
         backend.handle(Incoming::Reply { id: 1, result: Ok(json!({"agentInfo":{"name":"fake"}})) }, &mut events);
@@ -491,7 +501,7 @@ mod tests {
     /// A refused model is the picker's business, not an error of the chat; signing in stays as it was.
     #[test]
     fn a_refused_model_is_reported_as_such() {
-        let ctx = StartContext { cwd: std::env::temp_dir(), bridge: None, tools: None, wake: Box::new(|| {}) };
+        let ctx = StartContext { cwd: std::env::temp_dir(), bridge: None, computer: false, tools: None, wake: Box::new(|| {}) };
         let mut backend = AcpBackend::start(&["sh".into(), "-c".into(), "cat >/dev/null".into()], ctx).unwrap();
         let mut events = Vec::new();
         backend.handle(Incoming::Reply { id: 1, result: Ok(json!({"agentInfo":{"name":"fake"}})) }, &mut events);

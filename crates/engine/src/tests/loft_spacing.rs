@@ -75,3 +75,46 @@ fn a_hollow_elbow_is_cut_for_any_number_of_sections() {
         assert!(rel(got, want) < 3e-3, "{degrees} degrees, {sections} sections: {got} vs {want}");
     }
 }
+
+/// #6158: an airfoil section, two fit-point splines of 41 points closed by two lines, lofts on a
+/// sketch plane tilted 2.2° or 5° about X as it does on an axis-aligned one. The splines are
+/// approximated coordinate by coordinate in 3D, so on a tilted plane the end caps' wires missed
+/// their plane by more than truck's 1e-6 ("cap: cannot attach a plane to a wire that is not on
+/// one plane"); on an axis-aligned plane one coordinate stays constant.
+#[test]
+fn airfoil_sections_on_tilted_planes_get_their_caps() {
+    let section = |s: &mut Session, name: &str, y: f64, z: f64, tilt: f64, chord: f64, le: f64| {
+        let n = 41;
+        let round = |v: f64, places: i32| (v * 10f64.powi(places)).round() / 10f64.powi(places);
+        let (mut top, mut bottom) = (Vec::new(), Vec::new());
+        for i in 1..=n {
+            let u = 0.5 * (1.0 - (PI * i as f64 / n as f64).cos());
+            let half = 5.0 * 0.12 * (0.2969 * u.sqrt() - 0.126 * u - 0.3516 * u.powi(2) + 0.2843 * u.powi(3) - 0.1036 * u.powi(4)) * chord + 0.4 * u;
+            top.push([round(le + chord * u, 4), round(half, 4)]);
+            bottom.push([round(le + chord * u, 4), round(-half, 4)]);
+        }
+        bottom.reverse();
+        let t = tilt.to_radians();
+        let plane = json!({"origin": [0, y, z], "x_dir": [1, 0, 0], "y_dir": [0, round(-t.sin(), 6), round(t.cos(), 6)]});
+        run(s, "sketch.create", json!({"plane": plane, "name": name}));
+        run(s, "sketch.spline.fit_point", json!({"points": top}));
+        run(s, "sketch.line", json!({"points": [top[n - 1], bottom[0]]}));
+        run(s, "sketch.spline.fit_point", json!({"points": bottom}));
+        run(s, "sketch.line", json!({"points": [bottom[n - 1], top[0]]}));
+        run(s, "sketch.finish", json!({}));
+    };
+    let mut volumes = Vec::new();
+    for tilt in [0.0, 2.2, 5.0] {
+        let mut s = Session::default();
+        section(&mut s, "S0", 130.0, 0.24, tilt, 185.0, 42.2);
+        section(&mut s, "S1", 140.0, -0.12, tilt, 140.0, 46.4);
+        run(&mut s, "solid.loft", json!({"sections": [{"sketch": "S0"}, {"sketch": "S1"}], "name": "loft", "body_name": "WING"}));
+        volumes.push(run(&mut s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap_or(0.0));
+    }
+    // About 10 mm long between sections of 185 and 140 mm chord; tilting the planes by a few
+    // degrees changes their distance a little, not the solid.
+    assert!(volumes[0] > 1000.0, "{volumes:?}");
+    for v in &volumes[1..] {
+        assert!((v - volumes[0]).abs() < 0.02 * volumes[0], "{volumes:?}");
+    }
+}

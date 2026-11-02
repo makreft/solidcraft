@@ -122,11 +122,15 @@ pub enum Event {
 
 /// What a backend gets to start.
 pub struct StartContext {
-    /// Its working folder: an empty folder of SolidCraft's own, not the user's files.
+    /// Its working folder: an empty folder of SolidCraft's own, not the user's files (the home
+    /// folder when the user lets the agent use the computer).
     pub cwd: std::path::PathBuf,
     /// The MCP server that reaches this window (`solidcraft-cli mcp --connect` to the chat's own
     /// endpoint), for backends that start MCP servers; `None` when it could not be set up.
     pub bridge: Option<super::acp::McpBridge>,
+    /// The user lets the agent use the computer (`agent_computer_access`): its own tools stay on
+    /// and the MCP server has no folder limits.
+    pub computer: bool,
     /// Where tool calls run in process go, for backends that run their own tool loop.
     pub tools: Option<std::sync::mpsc::Sender<crate::ControlRequest>>,
     /// Wakes the window when something arrives.
@@ -144,6 +148,10 @@ pub trait ChatBackend {
     /// Start a fresh conversation on the running backend (no restart); [`Event::Ready`] follows.
     /// A message being answered is cancelled first.
     fn new_session(&mut self);
+    /// Whether the next session may use the computer (`agent_computer_access`) and where it
+    /// starts, so New chat follows the preference as it is then. Backends without their own
+    /// tools ignore it.
+    fn set_computer(&mut self, _computer: bool, _cwd: &std::path::Path) {}
     /// Answer an [`Event::Permission`] with one of its options (`None`: cancelled).
     fn answer_permission(&mut self, key: u64, option: Option<&str>);
     /// Ask the backend to sign in by itself with one of its methods (it opens the browser).

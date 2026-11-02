@@ -85,6 +85,7 @@ contact_new	false
 contact_off	false
 contact_sets	false
 continuity	false
+contour	false
 convert_sheet	false
 copy	false
 curvature_comb	false
@@ -191,6 +192,7 @@ plastic_assign	false
 plastic_rule	false
 play	false
 plus	false
+pocket	false
 point	false
 point_along_path	false
 point_center	false
@@ -201,6 +203,7 @@ point_vertex	false
 polygon	false
 polygon_circumscribed	false
 polygon_edge	false
+post	false
 presspull	false
 print_face	false
 project	false
@@ -238,6 +241,7 @@ settings_mouse	false
 settings_palette	false
 settings_plug	false
 settings_profile	false
+setup	false
 sheet	false
 sheet_rules	false
 shell	false
@@ -308,6 +312,7 @@ text	false
 thread	false
 timeline_play	false
 timeline_stop	false
+tool	false
 torus	false
 trace	false
 trim	false

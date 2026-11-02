@@ -80,7 +80,10 @@ pub struct BooleanDiagnostics {
     /// Why candidates of the retries that led to the result were discarded before they were
     /// measured (#3020: a coarse candidate whose edges run far outside the operands, which
     /// meshing never finished). Left out of the report when there are none.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    // `default`: left out when empty, so reading it back must not demand it; without this a
+    // saved model with any boolean retry failed to deserialise ("saved model: diagnostics")
+    // and every such design re-evaluated on open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rejected: Vec<String>,
 }
 
@@ -226,6 +229,18 @@ mod tests {
         assert!(capture_boolean_diagnostics(|| {}).1.events.is_empty());
         record(BooleanFallback::new(BooleanStrategy::ToolNudge));
         assert!(capture_boolean_diagnostics(|| {}).1.events.is_empty());
+    }
+
+    /// A report without rejections leaves the field out of its JSON; reading it back must not
+    /// demand it, or a saved model with any retried boolean is refused on open and the design
+    /// evaluates again.
+    #[test]
+    fn a_report_without_rejections_reads_back() {
+        let plain = capture_boolean_diagnostics(|| record(BooleanFallback::new(BooleanStrategy::ToolNudge))).1;
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("rejected").is_none());
+        let back: BooleanDiagnostics = serde_json::from_value(json).unwrap();
+        assert_eq!(back, plain);
     }
 
     /// Candidates discarded unmeasured (#3020) are reported with the attempt that led to the
