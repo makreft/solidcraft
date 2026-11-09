@@ -15,7 +15,13 @@ use crate::selection::{PROFILES, SelInput, SelectionExt as _};
 use crate::ui_kit::{StatusTone, choice_row, hint_row, status_line, text_row};
 
 /// The tool kinds as `cam.tool` names them, and their labels.
-const TOOL_KINDS: [(&str, &str); 3] = [("flat_endmill", "Flat End Mill"), ("ball_endmill", "Ball End Mill"), ("drill", "Drill")];
+const TOOL_KINDS: &[(&str, &str)] = &[
+    ("flat_endmill", "Flat End Mill"),
+    ("ball_endmill", "Ball End Mill"),
+    ("drill", "Drill"),
+    ("vbit", "V-Bit"),
+    ("tapered_ball", "Tapered Ball End Mill"),
+];
 /// The sides a contour runs on, and their labels.
 const SIDES: [(&str, &str); 3] = [("outside", "Outside"), ("inside", "Inside"), ("on", "On the Line")];
 /// Work offsets 1…6 as the program writes them.
@@ -71,6 +77,11 @@ pub struct ToolForm {
     pub plunge_feed: String,
     pub stepdown: String,
     pub stepover: String,
+    /// A V-bit's included tip angle and a tapered ball end mill's taper per side (degrees).
+    pub tip_angle: String,
+    pub taper_angle: String,
+    /// The flat at a V-bit's tip, or a tapered ball end mill's ball.
+    pub tip_diameter: String,
     pub description: String,
 }
 
@@ -208,6 +219,17 @@ pub fn rows(app: &SolveApp, ui: &mut egui::Ui, m: &mut Mach) -> bool {
             choice_row(ui, "Type", "cam_tool_kind", &mut f.kind, &kinds);
             enter |= hint_row(ui, "Diameter", &mut f.diameter, "mm");
             enter |= hint_row(ui, "Flute Length", &mut f.flute_length, "mm");
+            match TOOL_KINDS.get(f.kind).map(|k| k.0) {
+                Some("vbit") => {
+                    enter |= hint_row(ui, "Tip Angle", &mut f.tip_angle, "deg");
+                    enter |= hint_row(ui, "Tip Diameter", &mut f.tip_diameter, "0 mm");
+                }
+                Some("tapered_ball") => {
+                    enter |= hint_row(ui, "Taper Angle", &mut f.taper_angle, "deg");
+                    enter |= hint_row(ui, "Tip Diameter", &mut f.tip_diameter, "mm");
+                }
+                _ => {}
+            }
             enter |= hint_row(ui, "Flutes", &mut f.flutes, "2");
             enter |= hint_row(ui, "Spindle Speed", &mut f.spindle_rpm, "rev/min");
             enter |= hint_row(ui, "Feed", &mut f.feed, "mm/min");
@@ -315,6 +337,9 @@ fn load_tool(app: &SolveApp, f: &mut ToolForm) {
     f.plunge_feed = shown_opt(t.plunge_feed);
     f.stepdown = shown_opt(t.stepdown);
     f.stepover = shown_opt(t.stepover);
+    f.tip_angle = shown_opt(t.tip_angle);
+    f.taper_angle = shown_opt(t.taper_angle);
+    f.tip_diameter = if t.tip_diameter > 0.0 { shown(t.tip_diameter) } else { String::new() };
     f.description = t.description.clone();
 }
 
@@ -407,6 +432,17 @@ pub fn commands(app: &SolveApp, m: &Mach, inputs: &[SelInput]) -> Result<Vec<(St
             put_num(&mut p, "plunge_feed", number(app, &f.plunge_feed, "Plunge Feed")?);
             put_num(&mut p, "stepdown", length(app, &f.stepdown, "Stepdown")?);
             put_num(&mut p, "stepover", length(app, &f.stepover, "Stepover")?);
+            match TOOL_KINDS.get(f.kind).map(|k| k.0) {
+                Some("vbit") => {
+                    put_num(&mut p, "tip_angle", value(app, &f.tip_angle, "Tip Angle", expr::Kind::Angle)?.map(f64::to_degrees));
+                    put_num(&mut p, "tip_diameter", length(app, &f.tip_diameter, "Tip Diameter")?);
+                }
+                Some("tapered_ball") => {
+                    put_num(&mut p, "taper_angle", value(app, &f.taper_angle, "Taper Angle", expr::Kind::Angle)?.map(f64::to_degrees));
+                    put_num(&mut p, "tip_diameter", length(app, &f.tip_diameter, "Tip Diameter")?);
+                }
+                _ => {}
+            }
             if !f.description.trim().is_empty() {
                 p["description"] = json!(f.description.trim());
             }

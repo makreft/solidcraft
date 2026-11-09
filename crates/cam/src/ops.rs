@@ -1,4 +1,5 @@
-//! 2.5D operations: contours and pockets. Each one turns planar geometry
+//! 2.5D operations: contours and pockets, each also as rest machining after a larger tool.
+//! Each one turns planar geometry
 //! and cutting data into a [`Toolpath`] and checks it with [`verify`] before returning it.
 
 use std::f64::consts::PI;
@@ -20,7 +21,7 @@ const MAX_RINGS: usize = 2_000;
 /// Most times a ramp goes round its loop; a loop too short for that is plunged into instead.
 const MAX_RAMP_LAPS: f64 = 2000.0;
 /// Largest coordinate or height (mm).
-const MAX_COORD: f64 = 1.0e6;
+pub(crate) const MAX_COORD: f64 = 1.0e6;
 /// Most tabs on one loop.
 const MAX_TABS: usize = 1000;
 /// A corner of the toolpath that turns away from the material by more than this (radians) gets
@@ -78,7 +79,7 @@ pub struct Cut {
 }
 
 impl Cut {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         self.heights.validate()?;
         self.feeds.validate()?;
         if !(self.stepdown > 0.0) || !self.stepdown.is_finite() {
@@ -88,7 +89,7 @@ impl Cut {
     }
 
     /// Depth passes from the top down to the bottom, evenly spaced and at most a stepdown apart.
-    fn levels(&self) -> Result<Vec<f64>> {
+    pub(crate) fn levels(&self) -> Result<Vec<f64>> {
         let (top, bottom) = (self.heights.top, self.heights.bottom);
         let n = ((top - bottom) / self.stepdown - 1e-9).ceil().max(1.0);
         if !(n <= MAX_LEVELS as f64) {
@@ -111,6 +112,34 @@ pub enum Side {
     On,
 }
 
+/// Rest machining: the operation cuts only where an earlier, larger tool could not reach, in
+/// the inside corners and the openings it did not fit.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Rest {
+    /// The earlier tool's radius at the top of its cut (mm).
+    pub radius: f64,
+    /// How far from the walls that tool's centre ran: its radius and the stock it left (mm).
+    pub wall: f64,
+}
+
+impl Rest {
+    fn validate(&self, r: f64) -> Result<()> {
+        if !(self.radius > 0.0 && self.radius <= MAX_COORD) || !(self.wall >= self.radius && self.wall <= MAX_COORD) {
+            return invalid("rest machining needs the earlier tool's radius above 0 and its wall offset at least that");
+        }
+        if !(self.radius > r + 1e-9) {
+            return invalid("rest machining needs a tool smaller than the earlier one");
+        }
+        Ok(())
+    }
+}
+
+/// Sample spacing, in tool radii, when the rest of a loop is told apart from what was cut.
+const REST_SAMPLE: f64 = 0.25;
+/// Material thinner than this (mm) is not worth a rest cut: the slivers a curve drawn as short
+/// lines leaves at every vertex, a hair's width.
+const REST_MIN: f64 = 0.02;
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ContourParams {
     pub side: Side,
@@ -131,6 +160,9 @@ pub struct ContourParams {
     /// past the corner, so a square part fits all the way in.
     #[serde(default)]
     pub dogbones: bool,
+    /// Only where the earlier tool could not reach; no tabs, dogbones or ramps then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest: Option<Rest>,
 }
 
 /// Holding tabs of a contour: on the passes below their top the tool rises over each tab and
@@ -176,10 +208,14 @@ pub struct PocketParams {
     /// all the way into a pocket made for it.
     #[serde(default)]
     pub dogbones: bool,
+    /// Only where the earlier tool could not reach: the wall ring's corners and what it did not
+    /// fit into; no dogbones or ramps then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest: Option<Rest>,
 }
 
 /// Collects moves, keeping the tool's position.
-struct Builder {
+pub(crate) struct Builder {
     moves: Vec<Move>,
     pos: Option<Vec3>,
     h: Heights,
@@ -187,11 +223,11 @@ struct Builder {
 }
 
 impl Builder {
-    fn new(cut: &Cut) -> Builder {
+    pub(crate) fn new(cut: &Cut) -> Builder {
         Builder { moves: Vec::new(), pos: None, h: cut.heights, feeds: cut.feeds }
     }
 
-    fn push(&mut self, m: Move) -> Result<()> {
+    pub(crate) fn push(&mut self, m: Move) -> Result<()> {
         if self.moves.len() >= MAX_MOVES {
             return Err(CamError::TooLarge(format!("the toolpath has more than {MAX_MOVES} moves")));
         }
@@ -202,12 +238,17 @@ impl Builder {
         Ok(())
     }
 
+    /// Where the tool is, once it has moved.
+    pub(crate) fn position(&self) -> Option<Vec3> {
+        self.pos
+    }
+
     fn at(&self, p: Vec2) -> bool {
         self.pos.is_some_and(|q| Vec2::new(q.x, q.y).dist(p) <= 1e-9)
     }
 
     /// Up to the clearance height (if below it), then across to `p`.
-    fn travel_to(&mut self, p: Vec2) -> Result<()> {
+    pub(crate) fn travel_to(&mut self, p: Vec2) -> Result<()> {
         if let Some(q) = self.pos {
             if self.at(p) && q.z >= self.h.clearance {
                 return Ok(());
@@ -219,8 +260,17 @@ impl Builder {
         self.push(Move::Rapid { to: p.extend(self.h.clearance) })
     }
 
+    /// Straight down to the retract height at the rapid rate, when above it.
+    pub(crate) fn rapid_to_retract(&mut self) -> Result<()> {
+        let Some(q) = self.pos else { return Err(CamError::Unsafe("a rapid before the first positioning move".into())) };
+        if q.z > self.h.retract + 1e-9 {
+            self.push(Move::Rapid { to: Vec3::new(q.x, q.y, self.h.retract) })?;
+        }
+        Ok(())
+    }
+
     /// Straight down to `z`: rapid to the retract height, then at the plunge feed.
-    fn plunge_to(&mut self, z: f64) -> Result<()> {
+    pub(crate) fn plunge_to(&mut self, z: f64) -> Result<()> {
         let Some(q) = self.pos else { return Err(CamError::Unsafe("a plunge before the first positioning move".into())) };
         if q.z > self.h.retract {
             self.push(Move::Rapid { to: Vec3::new(q.x, q.y, self.h.retract) })?;
@@ -231,7 +281,7 @@ impl Builder {
         Ok(())
     }
 
-    fn cut_to(&mut self, p: Vec2, z: f64) -> Result<()> {
+    pub(crate) fn cut_to(&mut self, p: Vec2, z: f64) -> Result<()> {
         if self.at(p) && self.pos.is_some_and(|q| (q.z - z).abs() <= 1e-9) {
             return Ok(());
         }
@@ -240,7 +290,7 @@ impl Builder {
 
     /// Cuts along `piece` from wherever the tool is (within the offsetting's joining tolerance
     /// of the piece's start), going evenly from depth `z0` to `z1`.
-    fn cut_piece(&mut self, piece: &Piece, z0: f64, z1: f64) -> Result<()> {
+    pub(crate) fn cut_piece(&mut self, piece: &Piece, z0: f64, z1: f64) -> Result<()> {
         match *piece {
             Piece::Line { b, .. } => self.cut_to(b, z1),
             Piece::Arc { c, sweep, .. } => {
@@ -256,7 +306,7 @@ impl Builder {
         }
     }
 
-    fn cut_loop(&mut self, lp: &[Piece], z: f64, tabs: Option<&Terrain>) -> Result<()> {
+    pub(crate) fn cut_loop(&mut self, lp: &[Piece], z: f64, tabs: Option<&Terrain>) -> Result<()> {
         match tabs {
             Some(t) => self.cut_over(lp, z, z, t),
             None => lp.iter().try_for_each(|piece| self.cut_piece(piece, z, z)),
@@ -335,14 +385,14 @@ impl Builder {
         }
     }
 
-    fn retract(&mut self) -> Result<()> {
+    pub(crate) fn retract(&mut self) -> Result<()> {
         match self.pos {
             Some(q) if q.z < self.h.clearance => self.push(Move::Rapid { to: Vec3::new(q.x, q.y, self.h.clearance) }),
             _ => Ok(()),
         }
     }
 
-    fn finish(mut self) -> Result<Toolpath> {
+    pub(crate) fn finish(mut self) -> Result<Toolpath> {
         self.retract()?;
         let path = Toolpath { moves: self.moves };
         verify(&path, &self.h)?;
@@ -355,7 +405,7 @@ fn check_ramp(angle: f64) -> Result<()> {
 }
 
 /// A cut deeper than the tool's cutting edges would rub its shank in the slot.
-fn check_reach(tool: &Tool, cut: &Cut) -> Result<()> {
+pub(crate) fn check_reach(tool: &Tool, cut: &Cut) -> Result<()> {
     let depth = cut.heights.top - cut.heights.bottom;
     if depth > tool.flute_length + 1e-9 {
         return invalid(format!("the cut is {depth:.3} mm deep, but tool {} cuts only {:.3} mm (its flute length)", tool.number, tool.flute_length));
@@ -368,12 +418,12 @@ fn check_leave(leave: f64) -> Result<()> {
 }
 
 /// A milling operation needs a tool that cuts with its side: a drill only cuts at its point.
-fn mills(tool: &Tool) -> Result<()> {
+pub(crate) fn mills(tool: &Tool) -> Result<()> {
     if tool.kind == ToolKind::Drill { invalid("a drill cannot mill: it cuts only at its point") } else { Ok(()) }
 }
 
 /// The loop turned to start at its corner nearest to `p`.
-fn start_near(lp: &[Piece], p: Vec2) -> Vec<Piece> {
+pub(crate) fn start_near(lp: &[Piece], p: Vec2) -> Vec<Piece> {
     let first = lp.iter().enumerate().min_by(|a, b| a.1.start().dist(p).total_cmp(&b.1.start().dist(p))).map_or(0, |(i, _)| i);
     lp.iter().cycle().skip(first).take(lp.len()).copied().collect()
 }
@@ -391,7 +441,9 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
         t.validate(&cut.heights)?;
     }
     let shape = Shape::from_regions(regions, params.tolerance)?;
-    let away = tool.radius() + params.stock_to_leave;
+    // A tool that narrows to its tip (a ball below its equator, a V-bit) is widest at the top of
+    // the cut: offsetting by that half-width puts the top edge of the wall on the profile.
+    let away = tool.radius_at(cut.heights.top - cut.heights.bottom) + params.stock_to_leave;
     let mut loops = match params.side {
         Side::Outside => shape.offset(-away)?,
         Side::Inside => shape.offset(away)?,
@@ -399,6 +451,18 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
     };
     if loops.is_empty() {
         return invalid("the tool does not fit the profile");
+    }
+    if let Some(rest) = params.rest {
+        let r = tool.radius_at(cut.heights.top - cut.heights.bottom);
+        rest.validate(r)?;
+        // Where the earlier tool's centre ran, on the same side.
+        let earlier = match params.side {
+            Side::Outside => shape.offset(-rest.wall)?,
+            Side::Inside => shape.offset(rest.wall)?,
+            Side::On => Vec::new(),
+        };
+        let chains: Vec<(Vec<Piece>, bool)> = loops.iter().flat_map(|lp| rest_parts(lp, &earlier, rest.radius - r, r * REST_SAMPLE)).collect();
+        return cut_rest(&chains, &shape, away, r, cut);
     }
     // A cut through the stock frees what a loop encloses: smaller loops first, so every hole is
     // cut while the part round it is still held by its uncut outline.
@@ -488,7 +552,7 @@ fn is_wall_corner(shape: &Shape, corner: Vec2, c: Vec2, tip: Vec2, away: f64) ->
 
 /// The tabs of one loop: stretches (arc length from the loop's start) where the tool stays at
 /// `top` on the passes below it, coming down at 45° either side.
-struct Terrain {
+pub(crate) struct Terrain {
     flats: Vec<(f64, f64)>,
     top: f64,
 }
@@ -597,12 +661,21 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
     check_reach(tool, cut)?;
     check_leave(params.stock_to_leave)?;
     check_ramp(params.ramp_angle)?;
-    let r = tool.radius();
-    if !(params.stepover > 0.0) || !(params.stepover <= tool.diameter) {
-        return invalid("the stepover must be above 0 and at most the tool diameter");
+    // The floor is cleared by the tip: a tool that narrows to a point cannot clear one.
+    let floor = tool.floor_diameter();
+    if !(floor > 0.0) {
+        return invalid("a V-bit without a tip flat cannot clear a pocket: give it a `tip_diameter`, use a flat end mill, or engrave the outline");
+    }
+    let r = floor * 0.5;
+    if !(params.stepover > 0.0) || !(params.stepover <= floor) {
+        return invalid(if floor == tool.diameter {
+            "the stepover must be above 0 and at most the tool diameter".to_string()
+        } else {
+            format!("the stepover must be above 0 and at most the tool's width at its tip ({floor:.3} mm)")
+        });
     }
     let shape = Shape::from_regions(regions, params.tolerance)?;
-    let wall = r + params.stock_to_leave;
+    let wall = tool.radius_at(cut.heights.top - cut.heights.bottom) + params.stock_to_leave;
     let mut rings: Vec<Vec<Vec<Piece>>> = Vec::new();
     loop {
         let ring = shape.offset(wall + params.stepover * rings.len() as f64)?;
@@ -616,6 +689,15 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
     }
     if rings.is_empty() {
         return invalid("the tool does not fit the pocket");
+    }
+    if let Some(rest) = params.rest {
+        rest.validate(tool.radius_at(cut.heights.top - cut.heights.bottom))?;
+        // Only the band between this wall and the earlier one holds anything: inside it the
+        // earlier tool cleared everything.
+        let earlier = shape.offset(rest.wall)?;
+        let band = rings.iter().enumerate().filter(|(k, _)| wall + params.stepover * *k as f64 <= rest.wall + 1e-9).flat_map(|(_, ring)| ring);
+        let chains: Vec<(Vec<Piece>, bool)> = band.flat_map(|lp| rest_parts(lp, &earlier, rest.radius - r, r * REST_SAMPLE)).collect();
+        return cut_rest(&chains, &shape, wall, r, cut);
     }
     // Rings more than a radius apart leave material wherever the next ring in does not run
     // within a radius: the middle of a part of the pocket it no longer fits in, a passage that
@@ -676,6 +758,95 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
             }
             b.cut_to(start, z)?;
             down = Some(start);
+        }
+        cleared = z;
+        b.retract()?;
+    }
+    b.finish()
+}
+
+/// The stretches of `lp` where a tool `gap` smaller than the earlier one still meets material
+/// worth cutting: more than `gap` (and a hair) from the earlier tool's path `earlier`, which
+/// cleared everything within its radius of itself. Each stretch is a chain of pieces; `true` when it is the whole loop.
+fn rest_parts(lp: &[Piece], earlier: &[Vec<Piece>], gap: f64, sample: f64) -> Vec<(Vec<Piece>, bool)> {
+    let left = |p: Vec2| earlier.iter().flatten().map(|w| w.dist(p)).fold(f64::INFINITY, f64::min) > gap + REST_MIN;
+    let mut chains: Vec<Vec<Piece>> = Vec::new();
+    let mut open = false;
+    let mut all = true;
+    for piece in lp {
+        let n = ((piece.length() / sample.max(1e-3)).ceil() as usize).clamp(1, 10_000);
+        let kept: Vec<bool> = (0..=n).map(|i| left(piece.point_at(i as f64 / n as f64))).collect();
+        let mut i = 0;
+        while i <= n {
+            if !kept[i] {
+                all = false;
+                open = false;
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < n && kept[i + 1] {
+                i += 1;
+            }
+            // Half a sample beyond the last kept point either way, so nothing is left for want
+            // of a sample; the run within [0, 1].
+            let (t0, t1) = (((start as f64 - 0.5) / n as f64).max(0.0), ((i as f64 + 0.5) / n as f64).min(1.0));
+            if t1 - t0 > 1e-9 {
+                let part = piece.sub(t0, t1);
+                if open && start == 0 {
+                    if let Some(last) = chains.last_mut() {
+                        last.push(part);
+                    }
+                } else {
+                    chains.push(vec![part]);
+                }
+                open = i == n;
+            }
+            i += 1;
+        }
+    }
+    if all && !chains.is_empty() {
+        let whole: Vec<Piece> = chains.into_iter().flatten().collect();
+        return vec![(whole, true)];
+    }
+    // A run over the loop's seam (end of the last piece into the start of the first) is one chain.
+    if chains.len() > 1 && open && chains[0].first().map(Piece::start) == chains[chains.len() - 1].last().map(Piece::end) {
+        let first = chains.remove(0);
+        if let Some(last) = chains.last_mut() {
+            last.extend(first);
+        }
+    }
+    chains.into_iter().map(|c| (c, false)).collect()
+}
+
+/// Cuts `chains` at every depth pass: down into each one, along it, up and across to the next,
+/// or straight across where the way is clear of the walls.
+fn cut_rest(chains: &[(Vec<Piece>, bool)], shape: &Shape, wall: f64, r: f64, cut: &Cut) -> Result<Toolpath> {
+    if chains.is_empty() {
+        return Err(CamError::Nothing("the earlier tool left nothing for this one to cut".into()));
+    }
+    let mut b = Builder::new(cut);
+    let mut cleared = cut.heights.top;
+    for z in cut.levels()? {
+        let mut down: Option<Vec2> = None;
+        for (chain, closed) in chains {
+            let Some(first) = chain.first() else { continue };
+            let start = first.start();
+            match down {
+                Some(from) if link_is_clear(shape, from, start, wall, r) => b.cut_to(start, z)?,
+                _ => {
+                    b.travel_to(start)?;
+                    b.plunge_to(cleared)?;
+                    b.plunge_to(z)?;
+                }
+            }
+            for piece in chain {
+                b.cut_piece(piece, z, z)?;
+            }
+            if *closed {
+                b.cut_to(start, z)?;
+            }
+            down = b.position().map(|q| Vec2::new(q.x, q.y));
         }
         cleared = z;
         b.retract()?;

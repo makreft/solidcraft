@@ -179,3 +179,42 @@ fn every_manufacture_command_opens_its_dialog() {
     let d = form(&app, "cam.contour");
     assert!(apply_commands(&app, &d).unwrap_err().contains("setup"));
 }
+
+#[test]
+fn the_tool_dialog_makes_a_vbit_and_a_tapered_ball() {
+    let mut app = plate_app();
+    let mut d = form(&app, "cam.tool");
+    let f = tool_form(&mut d);
+    f.kind = TOOL_KINDS.iter().position(|k| k.0 == "vbit").unwrap();
+    f.number = "14".into();
+    f.diameter = "5".into();
+    f.flute_length = "4,5".into();
+    f.tip_angle = "80".into();
+    ok(&mut app, &d);
+    let t = app.session.doc.cam.tool(14).cloned().unwrap();
+    assert_eq!(serde_json::to_value(t.kind).unwrap(), json!("vbit"));
+    assert_eq!((t.tip_angle, t.tip_diameter), (Some(80.0), 0.0));
+
+    // Picking it back shows its type and angle, and no tip flat.
+    let mut d = form(&app, "cam.tool");
+    let f = tool_form(&mut d);
+    f.existing = 1;
+    load_tool(&app, f);
+    assert_eq!((TOOL_KINDS[f.kind].0, f.tip_angle.as_str(), f.tip_diameter.as_str()), ("vbit", "80", ""));
+
+    // A tapered ball end mill needs its ball: the command refuses one without, the dialog says so.
+    let mut d = form(&app, "cam.tool");
+    let f = tool_form(&mut d);
+    f.kind = TOOL_KINDS.iter().position(|k| k.0 == "tapered_ball").unwrap();
+    f.number = "10".into();
+    f.diameter = "3,175".into();
+    f.flute_length = "15".into();
+    f.taper_angle = "5,05".into();
+    let (id, p) = apply_commands(&app, &d).unwrap().remove(0);
+    assert!(app.run(&id, p).unwrap_err().to_string().contains("tip_diameter"));
+    tool_form(&mut d).tip_diameter = "0,5".into();
+    ok(&mut app, &d);
+    let t = app.session.doc.cam.tool(10).cloned().unwrap();
+    assert_eq!(serde_json::to_value(t.kind).unwrap(), json!("tapered_ball"));
+    assert!((t.taper_angle.unwrap() - 5.05).abs() < 1e-9 && (t.tip_diameter - 0.5).abs() < 1e-9, "{t:?}");
+}

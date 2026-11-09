@@ -9,6 +9,10 @@ fn v(x: f64, y: f64) -> Vec2 {
     Vec2::new(x, y)
 }
 
+fn v2(x: f64, y: f64) -> Vec2 {
+    Vec2::new(x, y)
+}
+
 fn polygon(pts: &[(f64, f64)]) -> Region2 {
     Region2 { outer: Loop2::polygon(&pts.iter().map(|p| v(p.0, p.1)).collect::<Vec<_>>()), holes: vec![] }
 }
@@ -148,7 +152,7 @@ fn polygon_with_many_shallow_corners_offsets_to_one_loop() {
 #[test]
 fn pocket_stays_inside_the_walls_and_clears_everything_the_tool_can_reach() {
     let regions = [rect(0.0, 0.0, 40.0, 30.0)];
-    let params = PocketParams { stepover: 2.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false };
+    let params = PocketParams { stepover: 2.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: None };
     let path = pocket(&regions, &tool(6.0), &params, &cut(0.0, -5.0, 2.0)).unwrap();
     let stats = path.stats();
     assert_eq!(stats.lowest_z, Some(-5.0));
@@ -173,7 +177,7 @@ fn pocket_stays_inside_the_walls_and_clears_everything_the_tool_can_reach() {
 fn pocket_goes_round_an_island() {
     let island = Loop2::circle(v(30.0, 20.0), 5.0);
     let regions = [Region2 { outer: rect(0.0, 0.0, 60.0, 40.0).outer, holes: vec![island] }];
-    let params = PocketParams { stepover: 3.0, climb: false, stock_to_leave: 0.5, tolerance: 0.01, ramp_angle: 0.0, dogbones: false };
+    let params = PocketParams { stepover: 3.0, climb: false, stock_to_leave: 0.5, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: None };
     let path = pocket(&regions, &tool(6.0), &params, &cut(0.0, -2.0, 2.0)).unwrap();
     let shape = Shape::from_regions(&regions, 0.01).unwrap();
     let pts = cutting_points(&path, 0.0);
@@ -197,7 +201,16 @@ fn contour_runs_round_the_part_with_the_wall_on_the_chosen_side() {
     let regions = [rect(0.0, 0.0, 40.0, 30.0)];
     let c = cut(0.0, -6.0, 3.0);
     let run = |climb: bool| {
-        let params = ContourParams { side: Side::Outside, climb, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones: false };
+        let params = ContourParams {
+            side: Side::Outside,
+            climb,
+            stock_to_leave: 0.0,
+            tolerance: 0.01,
+            ramp_angle: 0.0,
+            tabs: None,
+            dogbones: false,
+            rest: None,
+        };
         contour(&regions, &tool(6.0), &params, &c).unwrap()
     };
     let climb = run(true);
@@ -217,8 +230,16 @@ fn contour_runs_round_the_part_with_the_wall_on_the_chosen_side() {
         close(outside, 3.0, 1e-6);
     }
     // Inside an opening the tool must fit.
-    let inside =
-        ContourParams { side: Side::Inside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones: false };
+    let inside = ContourParams {
+        side: Side::Inside,
+        climb: true,
+        stock_to_leave: 0.0,
+        tolerance: 0.01,
+        ramp_angle: 0.0,
+        tabs: None,
+        dogbones: false,
+        rest: None,
+    };
     assert!(contour(&[rect(0.0, 0.0, 5.0, 5.0)], &tool(6.0), &inside, &c).is_err());
     let inner = contour(&regions, &tool(6.0), &inside, &c).unwrap();
     close(inner.stats().cut_length, 2.0 * 2.0 * (34.0 + 24.0) + 8.0, 1e-6);
@@ -230,8 +251,16 @@ fn contour_runs_round_the_part_with_the_wall_on_the_chosen_side() {
 fn holes_are_cut_before_the_outline_that_holds_the_part() {
     // The hole is given first and last: either way the tool goes round it before the outline.
     let hole = rect(10.0, 10.0, 20.0, 20.0).outer.reversed();
-    let params =
-        ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones: false };
+    let params = ContourParams {
+        side: Side::Outside,
+        climb: true,
+        stock_to_leave: 0.0,
+        tolerance: 0.01,
+        ramp_angle: 0.0,
+        tabs: None,
+        dogbones: false,
+        rest: None,
+    };
     for holes in [vec![hole.clone()], vec![hole.clone(), Loop2::circle(v(50.0, 15.0), 5.0)]] {
         let plate = [Region2 { outer: rect(0.0, 0.0, 60.0, 30.0).outer, holes }];
         let path = contour(&plate, &tool(6.0), &params, &cut(0.0, -6.0, 6.0)).unwrap();
@@ -249,7 +278,8 @@ fn dogbones_reach_into_the_inside_corners() {
     let part = [Region2 { outer: slotted.outer, holes: vec![rect(5.0, 5.0, 25.0, 15.0).outer.reversed()] }];
     let c = cut(0.0, -6.0, 6.0);
     let run = |dogbones: bool, climb: bool| {
-        let params = ContourParams { side: Side::Outside, climb, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones };
+        let params =
+            ContourParams { side: Side::Outside, climb, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones, rest: None };
         contour(&part, &tool(6.0), &params, &c).unwrap()
     };
     // The slot's floor and the window's corners: the tool's edge reaches each one.
@@ -272,7 +302,16 @@ fn dogbones_reach_into_the_inside_corners() {
     close(dist_to_cuts(&without, -5.9, v(25.0, 20.0)), 3.0 * 2f64.sqrt(), 1e-6);
 
     // From the inside of an opening, its corners.
-    let params = ContourParams { side: Side::Inside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones: true };
+    let params = ContourParams {
+        side: Side::Inside,
+        climb: true,
+        stock_to_leave: 0.0,
+        tolerance: 0.01,
+        ramp_angle: 0.0,
+        tabs: None,
+        dogbones: true,
+        rest: None,
+    };
     let window = contour(&[rect(0.0, 0.0, 30.0, 20.0)], &tool(6.0), &params, &c).unwrap();
     for (x, y) in [(0.0, 0.0), (30.0, 0.0), (30.0, 20.0), (0.0, 20.0)] {
         close(dist_to_cuts(&window, -5.9, v(x, y)), 3.0, 1e-6);
@@ -280,7 +319,8 @@ fn dogbones_reach_into_the_inside_corners() {
 
     // A pocket made for a square part, its corners notched along the walls.
     let housing = [rect(0.0, 0.0, 40.0, 18.0)];
-    let pocket_params = PocketParams { stepover: 2.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: true };
+    let pocket_params =
+        PocketParams { stepover: 2.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: true, rest: None };
     let pocketed = pocket(&housing, &tool(6.0), &pocket_params, &cut(0.0, -6.0, 3.0)).unwrap();
     for (x, y) in [(0.0, 0.0), (40.0, 0.0), (40.0, 18.0), (0.0, 18.0)] {
         close(dist_to_cuts(&pocketed, -5.9, v(x, y)), 3.0, 1e-6);
@@ -306,8 +346,16 @@ fn dogbones_stay_out_of_parts_closer_than_the_tool() {
     let parts = [rect(0.0, 0.0, 20.0, 20.0), rect(24.0, 0.0, 44.0, 20.0)];
     let shape = Shape::from_regions(&parts, 0.01).unwrap();
     let c = cut(0.0, -6.0, 6.0);
-    let params =
-        ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones: true };
+    let params = ContourParams {
+        side: Side::Outside,
+        climb: true,
+        stock_to_leave: 0.0,
+        tolerance: 0.01,
+        ramp_angle: 0.0,
+        tabs: None,
+        dogbones: true,
+        rest: None,
+    };
     let with = contour(&parts, &tool(6.0), &params, &c).unwrap();
     assert!(tight(&with, &shape, &[]) >= 3.0 - 0.006, "{}", tight(&with, &shape, &[]));
     let plain = contour(&parts, &tool(6.0), &ContourParams { dogbones: false, ..params }, &c).unwrap();
@@ -317,7 +365,7 @@ fn dogbones_stay_out_of_parts_closer_than_the_tool() {
     // notched, nothing cuts into the island or the wall beside it.
     let housing = [Region2 { outer: rect(0.0, 0.0, 50.0, 30.0).outer, holes: vec![rect(10.0, 4.0, 40.0, 20.0).outer.reversed()] }];
     let shape = Shape::from_regions(&housing, 0.01).unwrap();
-    let pp = PocketParams { stepover: 2.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: true };
+    let pp = PocketParams { stepover: 2.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: true, rest: None };
     let pocketed = pocket(&housing, &tool(6.0), &pp, &cut(0.0, -6.0, 3.0)).unwrap();
     let corners = [(0.0, 0.0), (50.0, 0.0), (50.0, 30.0), (0.0, 30.0)];
     assert!(tight(&pocketed, &shape, &corners) >= 3.0 - 0.006, "{}", tight(&pocketed, &shape, &corners));
@@ -363,6 +411,7 @@ fn tabs_on_one_side_let_the_cut_through_between_them() {
                 ramp_angle: ramp,
                 tabs: Some(tabs(spacing)),
                 dogbones: false,
+                rest: None,
             };
             let path = contour(std::slice::from_ref(&part), &tool(6.0), &params, &cut(0.0, -6.0, 3.0)).unwrap();
             let (total, longest) = on_tabs(&path, -4.0);
@@ -389,8 +438,17 @@ fn tabs_on_one_side_let_the_cut_through_between_them() {
 fn a_cut_deeper_than_the_flutes_is_refused() {
     let short = Tool::new(4, ToolKind::FlatEndmill, 3.0, 8.0);
     let part = [rect(0.0, 0.0, 40.0, 30.0)];
-    let cp = ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones: false };
-    let pp = PocketParams { stepover: 1.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false };
+    let cp = ContourParams {
+        side: Side::Outside,
+        climb: true,
+        stock_to_leave: 0.0,
+        tolerance: 0.01,
+        ramp_angle: 0.0,
+        tabs: None,
+        dogbones: false,
+        rest: None,
+    };
+    let pp = PocketParams { stepover: 1.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: None };
     let deep = cut(0.0, -12.0, 3.0);
     for err in [contour(&part, &short, &cp, &deep).unwrap_err(), pocket(&part, &short, &pp, &deep).unwrap_err()] {
         assert!(err.to_string().contains("flute length"), "{err}");
@@ -410,8 +468,16 @@ fn tabs_hold_the_part_and_its_waste() {
     let plate = [Region2 { outer: rect(0.0, 0.0, 200.0, 100.0).outer, holes: vec![rect(50.0, 25.0, 150.0, 75.0).outer.reversed()] }];
     let tabs = Tabs { width: 6.0, height: 2.0, spacing: 200.0, inner: true };
     let run = |tabs: Option<Tabs>, ramp: f64| {
-        let params =
-            ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: ramp, tabs, dogbones: false };
+        let params = ContourParams {
+            side: Side::Outside,
+            climb: true,
+            stock_to_leave: 0.0,
+            tolerance: 0.01,
+            ramp_angle: ramp,
+            tabs,
+            dogbones: false,
+            rest: None,
+        };
         contour(&plate, &tool(6.0), &params, &cut(0.0, -6.0, 3.0))
     };
     for ramp in [0.0, 3f64.to_radians()] {
@@ -490,8 +556,16 @@ fn ramps_replace_plunges_into_material() {
     let regions = [rect(0.0, 0.0, 40.0, 30.0)];
     // Round the part: each pass ramps once round the 140 + 6π loop, then cuts it flat.
     let c = cut(0.0, -6.0, 3.0);
-    let params =
-        ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: ramp, tabs: None, dogbones: false };
+    let params = ContourParams {
+        side: Side::Outside,
+        climb: true,
+        stock_to_leave: 0.0,
+        tolerance: 0.01,
+        ramp_angle: ramp,
+        tabs: None,
+        dogbones: false,
+        rest: None,
+    };
     let path = contour(&regions, &tool(6.0), &params, &c).unwrap();
     let lap = 140.0 + 6.0 * PI;
     close(path.stats().cut_length, 2.0 * (lap.hypot(3.0) + lap) + 2.0, 1e-6);
@@ -500,7 +574,7 @@ fn ramps_replace_plunges_into_material() {
     assert_eq!(path.stats().lowest_z, Some(-6.0));
 
     // In a pocket the first ring is short, so the ramp goes round it several times.
-    let params = PocketParams { stepover: 2.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: ramp, dogbones: false };
+    let params = PocketParams { stepover: 2.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: ramp, dogbones: false, rest: None };
     let path = pocket(&regions, &tool(6.0), &params, &cut(0.0, -5.0, 2.5)).unwrap();
     let (angle, plunges) = steepest(&path, 0.0);
     assert!(!plunges && angle <= ramp + 1e-6 && angle > 0.01, "{angle} {plunges}");
@@ -528,7 +602,7 @@ fn pocket_with_passes_up_to_a_diameter_apart_still_clears_the_middle() {
     // leaves a strip down the middle (15 from the long walls) more than a radius from it.
     let regions = [rect(0.0, 0.0, 40.0, 30.0)];
     for (stepover, name) in [(5.0, "wide"), (6.0, "a diameter"), (4.0, "moderate")] {
-        let params = PocketParams { stepover, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false };
+        let params = PocketParams { stepover, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: None };
         let path = pocket(&regions, &tool(6.0), &params, &cut(0.0, -2.0, 2.0)).unwrap();
         for p in cutting_points(&path, 0.0) {
             assert!(p.x >= 3.0 - 1e-6 && p.x <= 37.0 + 1e-6 && p.y >= 3.0 - 1e-6 && p.y <= 27.0 + 1e-6, "{name}: gouge at {p:?}");
@@ -546,7 +620,7 @@ fn pocket_with_passes_up_to_a_diameter_apart_still_clears_the_middle() {
         outer: polygon(&[(0.0, 0.0), (30.0, 0.0), (30.0, 8.0), (60.0, 8.0), (60.0, 26.0), (30.0, 26.0), (30.0, 40.0), (0.0, 40.0)]).outer,
         holes: vec![Loop2::circle(v(15.0, 20.0), 4.0)],
     };
-    let params = PocketParams { stepover: 5.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false };
+    let params = PocketParams { stepover: 5.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: None };
     let path = pocket(std::slice::from_ref(&rooms), &tool(6.0), &params, &cut(0.0, -2.0, 2.0)).unwrap();
     let shape = Shape::from_regions(std::slice::from_ref(&rooms), 0.01).unwrap();
     for p in cutting_points(&path, 0.0) {
@@ -563,6 +637,251 @@ fn pocket_with_passes_up_to_a_diameter_apart_still_clears_the_middle() {
     }
     let too_wide = PocketParams { stepover: 6.5, ..params };
     assert!(pocket(&regions, &tool(6.0), &too_wide, &cut(0.0, -2.0, 2.0)).is_err(), "passes more than a diameter apart");
+}
+
+/// The lab's engraving tools: a V-bit, a chamfer mill and a tapered ball end mill.
+fn vbit(angle: f64, diameter: f64) -> Tool {
+    Tool { tip_angle: Some(angle), ..Tool::new(14, ToolKind::VBit, diameter, 4.5) }
+}
+
+/// A V-bit with cutting edges long enough for a deep carving.
+fn long_vbit(angle: f64, diameter: f64) -> Tool {
+    Tool { tip_angle: Some(angle), ..Tool::new(15, ToolKind::VBit, diameter, 20.0) }
+}
+
+fn tapered_ball() -> Tool {
+    Tool { taper_angle: Some(5.05), tip_diameter: 0.5, ..Tool::new(10, ToolKind::TaperedBall, 3.175, 15.0) }
+}
+
+#[test]
+fn vbit_and_tapered_ball_tools_validate_and_report_their_width() {
+    // An 80° V-bit widens by 2·tan 40° per millimetre of depth, up to its 5 mm diameter.
+    let t14 = vbit(80.0, 5.0);
+    t14.validate().unwrap();
+    close(t14.width_at_depth(0.0), 0.0, 1e-9);
+    close(t14.width_at_depth(1.0), 2.0 * 40f64.to_radians().tan(), 1e-9);
+    close(t14.width_at_depth(1.0), 1.678, 1e-3);
+    close(t14.width_at_depth(10.0), 5.0, 1e-9);
+    close(t14.radius_at(1.0), 0.839, 1e-3);
+    close(t14.floor_diameter(), 0.0, 1e-9);
+    assert_eq!(t14.describe(), "V-bit 80deg");
+    // A 60° chamfer mill, capped at its 12.7 mm diameter: 11 mm down it is already full width.
+    let t12 = vbit(60.0, 12.7);
+    close(t12.width_at_depth(11.0), 12.7, 1e-9);
+    close(t12.width_at_depth(2.0), 4.0 * 30f64.to_radians().tan(), 1e-9);
+    // A tip flat adds to the width everywhere and is what clears a floor.
+    let flat = Tool { tip_diameter: 0.5, ..vbit(80.0, 5.0) };
+    close(flat.width_at_depth(1.0), 0.5 + 1.678, 1e-3);
+    close(flat.floor_diameter(), 0.5, 1e-9);
+    assert_eq!(flat.describe(), "V-bit 80deg tip 0.5");
+    // The tapered ball end mill: its R0.25 ball to a quarter millimetre down, then the 5.05° cone.
+    let t10 = tapered_ball();
+    t10.validate().unwrap();
+    close(t10.width_at_depth(0.25), 0.5, 1e-9);
+    close(t10.width_at_depth(1.5), 0.5 + 2.0 * 1.25 * 5.05f64.to_radians().tan(), 1e-9);
+    close(t10.width_at_depth(1.5), 0.721, 1e-3);
+    close(t10.width_at_depth(100.0), 3.175, 1e-9);
+    close(t10.floor_diameter(), 0.5, 1e-9);
+    assert_eq!(t10.describe(), "tapered ball R0.25 5.05deg");
+    // A ball end mill is narrower than its diameter above its equator, full width below it.
+    let ball = Tool::new(2, ToolKind::BallEndmill, 6.0, 20.0);
+    close(ball.width_at_depth(1.0), 2.0 * (9f64 - 4.0).sqrt(), 1e-9);
+    close(ball.width_at_depth(3.0), 6.0, 1e-9);
+    close(ball.width_at_depth(5.0), 6.0, 1e-9);
+    close(tool(6.0).width_at_depth(0.1), 6.0, 1e-9);
+    // Angles out of range, a missing angle, a tip wider than the tool, an angle on a flat end mill.
+    for bad in [
+        vbit(0.0, 5.0),
+        vbit(180.0, 5.0),
+        vbit(f64::NAN, 5.0),
+        Tool { tip_angle: None, ..vbit(80.0, 5.0) },
+        Tool { tip_diameter: 5.0, ..vbit(80.0, 5.0) },
+        Tool { tip_diameter: -0.1, ..vbit(80.0, 5.0) },
+        Tool { taper_angle: Some(90.0), ..tapered_ball() },
+        Tool { taper_angle: None, ..tapered_ball() },
+        Tool { tip_diameter: 0.0, ..tapered_ball() },
+        Tool { tip_diameter: 4.0, ..tapered_ball() },
+        Tool { tip_angle: Some(60.0), ..tool(6.0) },
+        Tool { taper_angle: Some(5.0), ..tool(6.0) },
+        Tool { tip_diameter: 1.0, ..tool(6.0) },
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn a_vbit_contour_offsets_by_its_width_at_depth_and_cannot_pocket_without_a_flat() {
+    let regions = [rect(0.0, 0.0, 40.0, 30.0)];
+    let t14 = vbit(80.0, 5.0);
+    let c = cut(0.0, -2.0, 2.0);
+    let params = ContourParams {
+        side: Side::Outside,
+        climb: true,
+        stock_to_leave: 0.0,
+        tolerance: 0.01,
+        ramp_angle: 0.0,
+        tabs: None,
+        dogbones: false,
+        rest: None,
+    };
+    let path = contour(&regions, &t14, &params, &c).unwrap();
+    // Round the outside, the centre runs the tool's half-width at the top of the cut from the
+    // wall: the top edge of the chamfer is on the outline.
+    let away = t14.radius_at(2.0);
+    close(away, 40f64.to_radians().tan() * 2.0, 1e-9);
+    let shape = Shape::from_regions(&regions, 0.01).unwrap();
+    for p in cutting_points(&path, -1e-9) {
+        close(shape.dist(Vec2::new(p.x, p.y)), away, 1e-3);
+    }
+    // A sharp V-bit cannot clear a floor; with a tip flat it pockets, stepping at most the flat.
+    let pocket_params =
+        PocketParams { stepover: 0.3, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: None };
+    let err = pocket(&regions, &t14, &pocket_params, &c).unwrap_err().to_string();
+    assert!(err.contains("tip"), "{err}");
+    let flat = Tool { tip_diameter: 1.0, ..vbit(80.0, 5.0) };
+    let too_wide = PocketParams { stepover: 1.2, ..pocket_params };
+    assert!(pocket(&[rect(0.0, 0.0, 10.0, 8.0)], &flat, &too_wide, &c).unwrap_err().to_string().contains("tip"));
+    let ok = PocketParams { stepover: 0.8, ..pocket_params };
+    let path = pocket(&[rect(0.0, 0.0, 10.0, 8.0)], &flat, &ok, &c).unwrap();
+    // The wall ring runs the width at the top of the cut from the wall; the tip clears inside it.
+    let wall = flat.radius_at(2.0);
+    let shape = Shape::from_regions(&[rect(0.0, 0.0, 10.0, 8.0)], 0.01).unwrap();
+    for p in cutting_points(&path, -1e-9) {
+        assert!(shape.dist(Vec2::new(p.x, p.y)) >= wall - 1e-3, "{p:?} is inside the wall offset {wall}");
+    }
+}
+
+#[test]
+fn tool_comments_name_the_angle() {
+    let mut program = drill_program();
+    program.operations[0].tool = Tool { tip_angle: Some(90.0), ..Tool::new(5, ToolKind::VBit, 6.0, 4.0) };
+    let text = emit(&program, &Post::rs274()).unwrap();
+    assert!(text.contains("T5 D6 V-bit 90deg"), "{text}");
+    program.operations[0].tool = tapered_ball();
+    let text = emit(&program, &Post::rs274()).unwrap();
+    assert!(text.contains("T10 D3.175 tapered ball R0.25 5.05deg"), "{text}");
+}
+
+fn chain(pts: &[(f64, f64)], closed: bool) -> Chain {
+    Chain { points: pts.iter().map(|p| v(p.0, p.1)).collect(), closed }
+}
+
+/// The XY distance from `q` to the nearest point of any chain's segments.
+fn dist_to_chains(chains: &[Chain], q: Vec2) -> f64 {
+    let mut best = f64::INFINITY;
+    for c in chains {
+        let n = c.points.len();
+        let pairs = if c.closed { n } else { n - 1 };
+        for i in 0..pairs {
+            let (a, b) = (c.points[i], c.points[(i + 1) % n]);
+            best = best.min(q.extend(0.0).dist_to_segment(a.extend(0.0), b.extend(0.0)));
+        }
+    }
+    best
+}
+
+#[test]
+fn engrave_cuts_every_chain_at_every_level_and_reverses_open_ones() {
+    let open = chain(&[(0.0, 0.0), (10.0, 0.0), (10.0, 5.0)], false);
+    let square = chain(&[(20.0, 0.0), (30.0, 0.0), (30.0, 10.0), (20.0, 10.0)], true);
+    let chains = [open.clone(), square.clone()];
+    let c = cut(0.0, -1.0, 0.5);
+    let path = engrave(&chains, &tool(2.0), &EngraveParams { tolerance: 0.01 }, &c).unwrap();
+    // Every cutting point lies on a chain: nothing is offset.
+    for p in cutting_points(&path, -1e-9) {
+        close(dist_to_chains(&chains, Vec2::new(p.x, p.y)), 0.0, 1e-6);
+    }
+    // Two levels on each chain: four vertical feeds into the material, none of them a travel.
+    let plunges: Vec<_> = path
+        .moves
+        .windows(2)
+        .filter(|w| matches!((w[0].target(), w[1]), (Some(a), Move::Feed { to, .. }) if Vec2::new(a.x, a.y).dist(Vec2::new(to.x, to.y)) <= 1e-9 && to.z < a.z && to.z < 0.0))
+        .collect();
+    assert_eq!(plunges.len(), 4, "{plunges:?}");
+    // The open chain's second level runs back from its far end: after reaching (10, 5) at −0.5
+    // the tool goes down there and comes back to (0, 0) at −1, never travelling in between.
+    let feeds: Vec<Vec3> = path
+        .moves
+        .iter()
+        .filter_map(|m| match m {
+            Move::Feed { to, .. } => Some(*to),
+            _ => None,
+        })
+        .collect();
+    let at_end = feeds.iter().position(|p| p.x == 10.0 && p.y == 5.0 && p.z == -0.5).unwrap();
+    assert_eq!(feeds[at_end + 1], Vec3::new(10.0, 5.0, -1.0), "{feeds:?}");
+    assert_eq!(feeds[at_end + 3], Vec3::new(0.0, 0.0, -1.0), "{feeds:?}");
+    // The square comes back to its start on each level.
+    let on_square: Vec<Vec3> = feeds.iter().copied().filter(|p| p.x >= 20.0).collect();
+    assert_eq!(on_square.iter().filter(|p| p.x == 20.0 && p.y == 0.0 && p.z == -1.0).count(), 2, "{on_square:?}");
+    // Rapids only at the clearance or the retract height, except straight down into the start.
+    for m in &path.moves {
+        if let Move::Rapid { to } = m {
+            assert!(to.z >= 2.0 - 1e-9, "{to:?}");
+        }
+    }
+    verify(&path, &c.heights).unwrap();
+}
+
+#[test]
+fn engrave_joins_touching_pieces_and_starts_nearest() {
+    // Three sides of a square, drawn apart within the tolerance, and the fourth: one closed chain.
+    let pieces = [
+        chain(&[(0.0, 0.0), (10.0, 0.0)], false),
+        chain(&[(10.0, 10.0), (0.0, 10.0)], false),
+        chain(&[(10.0, 0.005), (10.0, 10.0)], false),
+        chain(&[(0.0, 10.0), (0.0, 0.0)], false),
+        // A far stroke whose end is nearer to the square than its start: it is run backwards.
+        chain(&[(80.0, 0.0), (40.0, 0.0)], false),
+    ];
+    let c = cut(0.0, -0.5, 1.0);
+    let path = engrave(&pieces, &tool(1.0), &EngraveParams { tolerance: 0.01 }, &c).unwrap();
+    // Exactly two travels across at the clearance height (one per chain), so the square was joined.
+    let mut travels = 0;
+    let mut last: Option<Vec3> = None;
+    for m in &path.moves {
+        if let Move::Rapid { to } = m
+            && to.z == 10.0
+            && last.is_none_or(|q| Vec2::new(q.x, q.y).dist(Vec2::new(to.x, to.y)) > 1e-9)
+        {
+            travels += 1;
+        }
+        last = m.target().or(last);
+    }
+    assert_eq!(travels, 2, "{:?}", path.moves);
+    let feeds: Vec<Vec3> = path
+        .moves
+        .iter()
+        .filter_map(|m| match m {
+            Move::Feed { to, .. } => Some(*to),
+            _ => None,
+        })
+        .collect();
+    let far: Vec<&Vec3> = feeds.iter().filter(|p| p.x >= 40.0 && p.z < 0.0).collect();
+    assert_eq!((far[0].x, far[far.len() - 1].x), (40.0, 80.0), "the far stroke runs from its near end: {far:?}");
+    // Pieces too far apart stay apart: two chains, and the gap is never cut.
+    let apart = [chain(&[(0.0, 0.0), (10.0, 0.0)], false), chain(&[(10.0, 1.0), (10.0, 10.0)], false)];
+    let path = engrave(&apart, &tool(1.0), &EngraveParams { tolerance: 0.01 }, &c).unwrap();
+    for p in cutting_points(&path, -1e-9) {
+        close(dist_to_chains(&apart, Vec2::new(p.x, p.y)), 0.0, 1e-6);
+    }
+}
+
+#[test]
+fn engrave_refuses_drills_and_bad_chains() {
+    let c = cut(0.0, -1.0, 1.0);
+    let params = EngraveParams { tolerance: 0.01 };
+    let line = [chain(&[(0.0, 0.0), (10.0, 0.0)], false)];
+    let err = engrave(&line, &Tool::new(1, ToolKind::Drill, 3.0, 20.0), &params, &c).unwrap_err().to_string();
+    assert!(err.contains("drill"), "{err}");
+    assert!(engrave(&[chain(&[(0.0, 0.0)], false)], &tool(1.0), &params, &c).is_err(), "one point");
+    assert!(engrave(&[chain(&[(0.0, 0.0), (1.0, 0.0)], true)], &tool(1.0), &params, &c).is_err(), "closed with two points");
+    assert!(engrave(&[chain(&[(0.0, 0.0), (f64::NAN, 0.0)], false)], &tool(1.0), &params, &c).is_err(), "NaN");
+    assert!(engrave(&[], &tool(1.0), &params, &c).is_err(), "nothing");
+    assert!(engrave(&line, &tool(1.0), &EngraveParams { tolerance: 0.0 }, &c).is_err(), "no tolerance");
+    assert!(engrave(&line, &Tool::new(1, ToolKind::FlatEndmill, 1.0, 0.5), &params, &c).is_err(), "deeper than the flutes");
+    // A V-bit engraves: that is what it is for.
+    engrave(&line, &vbit(60.0, 6.0), &params, &c).unwrap();
 }
 
 /// Two holes plunged at 200 mm/min with a quarter-second dwell, written out move by move.
@@ -589,6 +908,248 @@ fn drill_program() -> Program {
         name: "Bracket (rev 2)".into(),
         operations: vec![Operation { name: "Drill".into(), tool: t, spindle_rpm: 3000.0, coolant: true, path }],
     }
+}
+
+fn hole(x: f64, y: f64, bottom: f64) -> Hole {
+    Hole { at: v(x, y), bottom }
+}
+
+#[test]
+fn drill_writes_the_hand_built_program() {
+    let holes = [hole(10.0, 10.0, -10.0), hole(30.5, 10.0, -10.0)];
+    let t = Tool::new(3, ToolKind::Drill, 5.0, 40.0);
+    let path = drill(&holes, &t, &DrillParams { peck: None, dwell: 0.25 }, &cut(0.0, -10.0, 1.0)).unwrap();
+    assert_eq!(path.moves, drill_program().operations[0].path.moves);
+}
+
+#[test]
+fn pecks_retract_and_re_enter_above_the_last_bottom() {
+    let c = cut(0.0, -10.0, 10.0);
+    let path = drill(&[hole(5.0, 5.0, -10.0)], &tool(3.0), &DrillParams { peck: Some(4.0), dwell: 0.5 }, &c).unwrap();
+    let feeds: Vec<f64> = path
+        .moves
+        .iter()
+        .filter_map(|m| match m {
+            Move::Feed { to, .. } => Some(to.z),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(feeds, vec![-4.0, -8.0, -10.0]);
+    // Every rapid below the retract height goes straight down, a tenth above the last peck.
+    let mut deepest = f64::INFINITY;
+    let mut re_entries = Vec::new();
+    for m in &path.moves {
+        match m {
+            Move::Feed { to, .. } => deepest = deepest.min(to.z),
+            Move::Rapid { to } if to.z < 2.0 => {
+                assert_eq!((to.x, to.y), (5.0, 5.0));
+                re_entries.push(to.z);
+                close(to.z, deepest + 0.1, 1e-9);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(re_entries, vec![-3.9, -7.9]);
+    assert!(path.moves.iter().any(|m| matches!(m, Move::Dwell { seconds } if *seconds == 0.5)));
+    verify(&path, &c.heights).unwrap();
+    // The time counts the dwell: 6 + 4.1 + 2.1 mm of feed at 200 mm/min, plus half a second.
+    close(path.stats().cut_minutes, 12.2 / 200.0 + 0.5 / 60.0, 1e-9);
+}
+
+#[test]
+fn drill_orders_holes_nearest_first_and_refuses_bad_ones() {
+    let c = cut(0.0, -3.0, 3.0);
+    let params = DrillParams { peck: None, dwell: 0.0 };
+    // From the first hole, always the nearest next: 0, 10, 50, not 0, 50, 10.
+    let holes = [hole(0.0, 0.0, -3.0), hole(50.0, 0.0, -3.0), hole(10.0, 0.0, -1.0)];
+    let path = drill(&holes, &tool(3.0), &params, &c).unwrap();
+    let plunged: Vec<(f64, f64)> = path
+        .moves
+        .iter()
+        .filter_map(|m| match m {
+            Move::Feed { to, .. } => Some((to.x, to.z)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(plunged, vec![(0.0, -3.0), (10.0, -1.0), (50.0, -3.0)]);
+    // Many holes go row by row, every hole once.
+    let grid: Vec<Hole> = (0..60).flat_map(|i| (0..60).map(move |j| hole(i as f64, j as f64, -0.5))).collect();
+    let path = drill(&grid, &vbit(60.0, 6.0), &params, &c).unwrap();
+    assert_eq!(path.moves.iter().filter(|m| matches!(m, Move::Feed { .. })).count(), 3600);
+    verify(&path, &c.heights).unwrap();
+    // A V-bit drills (halftone dots); a hole above the top or below the bottom, a peck of 0, a
+    // negative dwell, a NaN and no holes at all are refused.
+    drill(&[hole(0.0, 0.0, -0.3)], &vbit(60.0, 6.0), &params, &c).unwrap();
+    assert!(drill(&[hole(0.0, 0.0, 0.0)], &tool(3.0), &params, &c).is_err(), "at the top");
+    assert!(drill(&[hole(0.0, 0.0, -3.5)], &tool(3.0), &params, &c).is_err(), "below the bottom");
+    assert!(drill(&[hole(0.0, 0.0, -3.0)], &tool(3.0), &DrillParams { peck: Some(0.0), dwell: 0.0 }, &c).is_err());
+    assert!(drill(&[hole(0.0, 0.0, -3.0)], &tool(3.0), &DrillParams { peck: None, dwell: -1.0 }, &c).is_err());
+    assert!(drill(&[hole(f64::NAN, 0.0, -3.0)], &tool(3.0), &params, &c).is_err());
+    assert!(drill(&[], &tool(3.0), &params, &c).is_err());
+    assert!(drill(&[hole(0.0, 0.0, -3.0)], &Tool::new(1, ToolKind::Drill, 3.0, 2.0), &params, &c).is_err(), "deeper than the flutes");
+}
+
+/// Every cutting point of a carving is as far from the boundary as the cone is wide at its depth:
+/// the cone's edge touches the wall. Points at the floor (held at the bottom) are further in.
+fn check_vcarve(regions: &[Region2], tool: &Tool, path: &Toolpath, top: f64, bottom: f64) {
+    let shape = Shape::from_regions(regions, 0.01).unwrap();
+    let tan_half = (tool.tip_angle.unwrap().to_radians() * 0.5).tan();
+    let tip = tool.tip_diameter * 0.5;
+    for p in cutting_points(path, top - 1e-9) {
+        let d = shape.dist(Vec2::new(p.x, p.y));
+        let want = tip + (top - p.z) * tan_half;
+        if p.z > bottom + 1e-9 {
+            close(d, want, 2e-3);
+        } else {
+            assert!(d >= want - 2e-3, "{p:?} is {d} in, the cone reaches {want}");
+        }
+    }
+}
+
+#[test]
+fn vcarve_follows_the_inward_offsets_at_the_depth_the_cone_touches_the_wall() {
+    let square = [rect(0.0, 0.0, 10.0, 10.0)];
+    let bit = long_vbit(90.0, 12.0);
+    let params = VCarveParams { stepover: 0.5, tolerance: 0.01 };
+    let c = cut(0.0, -10.0, 10.0);
+    let v = vcarve(&square, &bit, &params, &c).unwrap();
+    // A 90° bit goes as deep as it is far from the wall: rings at 0.5 … 4.5 (5 is the middle).
+    assert_eq!(v.rings, 9);
+    close(v.deepest, -4.5, 1e-9);
+    close(v.natural_depth, 4.5, 1e-9);
+    assert!(!v.flat_floor);
+    check_vcarve(&square, &bit, &v.path, 0.0, -10.0);
+    verify(&v.path, &c.heights).unwrap();
+    // Held at 2 mm: the inner rings run at the bottom and the floor is flat.
+    let held = vcarve(&square, &bit, &params, &cut(0.0, -2.0, 2.0)).unwrap();
+    assert_eq!(held.rings, 9);
+    assert!(held.flat_floor);
+    close(held.deepest, -2.0, 1e-9);
+    close(held.natural_depth, 4.5, 1e-9);
+    check_vcarve(&square, &bit, &held.path, 0.0, -2.0);
+    // Nested rings are linked with a cut, not a travel: one travel for the whole square.
+    let travels = v.path.moves.iter().filter(|m| matches!(m, Move::Rapid { to } if to.z == 10.0)).count();
+    assert_eq!(travels, 2, "down to the start and back up: {:?}", v.path.moves.iter().take(6).collect::<Vec<_>>());
+}
+
+#[test]
+fn vcarve_of_a_slot_a_letter_and_bad_tools() {
+    // A 1 mm wide slot with a 60° bit: rings to 0.4 in (0.5 is the middle), 0.4 / tan 30° deep.
+    let slot = [rect(0.0, 0.0, 20.0, 1.0)];
+    let bit = long_vbit(60.0, 6.0);
+    let params = VCarveParams { stepover: 0.1, tolerance: 0.01 };
+    let v = vcarve(&slot, &bit, &params, &cut(0.0, -5.0, 5.0)).unwrap();
+    assert_eq!(v.rings, 4);
+    close(v.natural_depth, 0.4 / 30f64.to_radians().tan(), 1e-9);
+    close(v.natural_depth, 0.693, 1e-3);
+    check_vcarve(&slot, &bit, &v.path, 0.0, -5.0);
+    // A letter O: an island inside; the rings run between the two walls.
+    let o = [Region2 { outer: Loop2::circle(v2(20.0, 20.0), 10.0), holes: vec![Loop2::circle(v2(20.0, 20.0), 6.0).reversed()] }];
+    let v = vcarve(&o, &bit, &VCarveParams { stepover: 0.25, tolerance: 0.01 }, &cut(0.0, -5.0, 5.0)).unwrap();
+    assert!(v.rings >= 7, "{}", v.rings);
+    close(v.natural_depth, 1.75 / 30f64.to_radians().tan(), 1e-9);
+    check_vcarve(&o, &bit, &v.path, 0.0, -5.0);
+    // A tip flat: the first ring starts half the flat further in, and the cone is wider.
+    let flat = Tool { tip_diameter: 0.4, ..long_vbit(60.0, 6.0) };
+    let v = vcarve(&slot, &flat, &params, &cut(0.0, -5.0, 5.0)).unwrap();
+    assert_eq!(v.rings, 2, "0.3 and 0.4 in");
+    check_vcarve(&slot, &flat, &v.path, 0.0, -5.0);
+    // Not a V-bit, too fine a stepover, nothing wider than the tip.
+    assert!(vcarve(&slot, &tool(6.0), &params, &cut(0.0, -5.0, 5.0)).unwrap_err().to_string().contains("V-bit"));
+    assert!(vcarve(&slot, &bit, &VCarveParams { stepover: 0.001, tolerance: 0.01 }, &cut(0.0, -5.0, 5.0)).is_err());
+    assert!(vcarve(&[rect(0.0, 0.0, 20.0, 0.05)], &bit, &params, &cut(0.0, -5.0, 5.0)).is_err());
+}
+
+#[test]
+fn the_simulation_lowers_the_stock_where_the_tool_cuts_with_its_own_shape() {
+    // A 10 mm slot with a 2 mm flat end mill, 1 mm deep: 10 × 2 plus two half discs.
+    let c = cut(0.0, -1.0, 1.0);
+    let slot = engrave(&[chain(&[(5.0, 10.0), (15.0, 10.0)], false)], &tool(2.0), &EngraveParams { tolerance: 0.01 }, &c).unwrap();
+    let mut map = Heightmap::new(v(0.0, 0.0), v(20.0, 20.0), 0.0, 0.1).unwrap();
+    assert_eq!((map.width, map.height), (200, 200));
+    let removed = map.cut(&tool(2.0), &slot).unwrap();
+    close(removed, 20.0 + PI, 0.5);
+    close(map.removed(), removed, 1e-9);
+    close(map.deepest(), -1.0, 1e-9);
+    // Under the middle of the slot the floor is flat at −1; beside it the stock stands.
+    let at = |x: f64, y: f64| f64::from(map.z[((y / 0.1) as usize) * map.width + (x / 0.1) as usize]);
+    close(at(10.0, 10.0), -1.0, 1e-6);
+    close(at(10.0, 10.9), -1.0, 1e-6);
+    close(at(10.0, 12.0), 0.0, 1e-6);
+    close(at(2.0, 10.0), 0.0, 1e-6);
+    // A V-bit's groove is as wide at the top as the cone: 90° means as wide as deep on each side.
+    let vee = engrave(&[chain(&[(5.0, 5.0), (15.0, 5.0)], false)], &long_vbit(90.0, 6.0), &EngraveParams { tolerance: 0.01 }, &c).unwrap();
+    let mut map = Heightmap::new(v(0.0, 0.0), v(20.0, 20.0), 0.0, 0.05).unwrap();
+    map.cut(&long_vbit(90.0, 6.0), &vee).unwrap();
+    let at = |x: f64, y: f64| f64::from(map.z[((y / 0.05) as usize) * map.width + (x / 0.05) as usize]);
+    close(at(10.0, 5.025), -1.0, 0.05);
+    close(at(10.0, 5.525), -0.5, 0.05);
+    close(at(10.0, 6.1), 0.0, 1e-6);
+    // What stands in a region: the slot's own area is cleared, a wider pocket is not.
+    let mut map = Heightmap::new(v(0.0, 0.0), v(20.0, 20.0), 0.0, 0.1).unwrap();
+    map.cut(&tool(2.0), &slot).unwrap();
+    let (standing, inside) = map.standing_in(&rect(5.0, 9.2, 15.0, 10.8), -1.0);
+    assert!(inside > 1500 && standing == 0, "{standing} of {inside}");
+    let (standing, inside) = map.standing_in(&rect(0.0, 0.0, 20.0, 20.0), -1.0);
+    assert!(standing > inside * 9 / 10, "{standing} of {inside}");
+    // Too fine a grid, and bad stock, are refused.
+    assert!(Heightmap::new(v(0.0, 0.0), v(1000.0, 1000.0), 0.0, 0.1).is_err());
+    assert!(Heightmap::new(v(0.0, 0.0), v(0.0, 20.0), 0.0, 0.1).is_err());
+    assert!(Heightmap::new(v(0.0, 0.0), v(20.0, 20.0), 0.0, 0.0).is_err());
+}
+
+#[test]
+fn rest_machining_cuts_only_where_the_larger_tool_could_not_reach() {
+    // A 20 × 20 pocket cleared with a 6 mm cutter leaves its four corners round (R3). A 2 mm
+    // cutter after it runs only there: every cut is within reach of a corner, and far shorter
+    // than the whole wall ring.
+    let regions = [rect(0.0, 0.0, 20.0, 20.0)];
+    let c = cut(0.0, -2.0, 2.0);
+    let big = tool(6.0);
+    let rest = Rest { radius: big.radius_at(2.0), wall: big.radius_at(2.0) };
+    let params =
+        PocketParams { stepover: 1.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: Some(rest) };
+    let path = pocket(&regions, &tool(2.0), &params, &c).unwrap();
+    let corners = [v(0.0, 0.0), v(20.0, 0.0), v(20.0, 20.0), v(0.0, 20.0)];
+    let pts = cutting_points(&path, -1e-9);
+    assert!(!pts.is_empty());
+    for p in &pts {
+        let q = Vec2::new(p.x, p.y);
+        let nearest = corners.iter().map(|c| c.dist(q)).fold(f64::INFINITY, f64::min);
+        assert!(nearest <= 3.2, "{p:?} is {nearest} from the nearest corner");
+        // Still a radius from the wall, as any pocket pass.
+        assert!(q.x >= 1.0 - 1e-6 && q.y >= 1.0 - 1e-6 && q.x <= 19.0 + 1e-6 && q.y <= 19.0 + 1e-6, "{p:?}");
+    }
+    let full = PocketParams { rest: None, ..params };
+    let whole = pocket(&regions, &tool(2.0), &full, &c).unwrap();
+    assert!(path.stats().cut_length < whole.stats().cut_length / 3.0, "{} vs {}", path.stats().cut_length, whole.stats().cut_length);
+    verify(&path, &c.heights).unwrap();
+    // A tool as large as the earlier one has nothing left; a larger one is refused.
+    let same = PocketParams { rest: Some(Rest { radius: 1.0, wall: 1.0 }), ..params };
+    assert!(matches!(pocket(&regions, &tool(2.0), &same, &c), Err(CamError::Invalid(_))));
+    let round = [Region2 { outer: Loop2::circle(v(10.0, 10.0), 10.0), holes: vec![] }];
+    assert!(matches!(pocket(&round, &tool(2.0), &params, &c), Err(CamError::Nothing(_))), "a round pocket has no corners");
+    // A contour inside an opening: the same corners, and nothing along the straight walls.
+    let inside = ContourParams {
+        side: Side::Inside,
+        climb: true,
+        stock_to_leave: 0.0,
+        tolerance: 0.01,
+        ramp_angle: 0.0,
+        tabs: None,
+        dogbones: false,
+        rest: Some(rest),
+    };
+    let path = contour(&regions, &tool(2.0), &inside, &c).unwrap();
+    for p in cutting_points(&path, -1e-9) {
+        let q = Vec2::new(p.x, p.y);
+        assert!(corners.iter().any(|c| c.dist(q) <= 3.2), "{p:?}");
+    }
+    // Where the earlier tool left stock on the wall, the band is wider: its path ran further in.
+    let left = Rest { radius: 3.0, wall: 3.5 };
+    let wider = PocketParams { rest: Some(left), ..params };
+    let path = pocket(&regions, &tool(2.0), &wider, &c).unwrap();
+    assert!(path.stats().cut_length > 0.0);
 }
 
 /// A post for a controller that wants a decimal point on every number, two-digit motion codes,
@@ -648,7 +1209,7 @@ M30
 fn written_program_reads_back_as_the_same_path() {
     let island = Loop2::circle(v(30.0, 20.0), 5.0);
     let regions = [Region2 { outer: rect(0.0, 0.0, 60.0, 40.0).outer, holes: vec![island] }];
-    let params = PocketParams { stepover: 3.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false };
+    let params = PocketParams { stepover: 3.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: None };
     let path = pocket(&regions, &tool(6.0), &params, &cut(0.0, -4.0, 2.0)).unwrap();
     let program = Program {
         work_offset: None,
@@ -680,7 +1241,15 @@ fn written_program_reads_back_as_the_same_path() {
 fn every_post_writes_within_its_own_precision() {
     let island = Loop2::circle(v(30.0, 20.0), 5.0);
     let regions = [Region2 { outer: rect(0.0, 0.0, 60.0, 40.0).outer, holes: vec![island] }];
-    let params = PocketParams { stepover: 3.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 3.0f64.to_radians(), dogbones: false };
+    let params = PocketParams {
+        stepover: 3.0,
+        climb: true,
+        stock_to_leave: 0.0,
+        tolerance: 0.01,
+        ramp_angle: 3.0f64.to_radians(),
+        dogbones: false,
+        rest: None,
+    };
     let path = pocket(&regions, &tool(6.0), &params, &cut(0.0, -4.0, 2.0)).unwrap();
     let mut program = Program {
         work_offset: None,
@@ -883,9 +1452,17 @@ fn hostile_values_are_errors_never_panics() {
         let _ = offset_regions(&[rect(0.0, 0.0, b, b)], 1.0, 0.01);
         let _ = offset_regions(&[Region2 { outer: Loop2::circle(v(b, b), b), holes: vec![Loop2::circle(v(0.0, b), b)] }], b, 0.01);
         let t = Tool::new(1, ToolKind::FlatEndmill, b, b);
-        let pocket_params = PocketParams { stepover: b, climb: true, stock_to_leave: b, tolerance: b, ramp_angle: b, dogbones: false };
-        let contour_params =
-            ContourParams { side: Side::Outside, climb: true, stock_to_leave: b, tolerance: b, ramp_angle: b, tabs: None, dogbones: false };
+        let pocket_params = PocketParams { stepover: b, climb: true, stock_to_leave: b, tolerance: b, ramp_angle: b, dogbones: false, rest: None };
+        let contour_params = ContourParams {
+            side: Side::Outside,
+            climb: true,
+            stock_to_leave: b,
+            tolerance: b,
+            ramp_angle: b,
+            tabs: None,
+            dogbones: false,
+            rest: None,
+        };
         let bad_cut = Cut { heights: Heights { clearance: b, retract: b, top: b, bottom: -b }, feeds: Feeds { cut: b, plunge: b }, stepdown: b };
         for c in [good_cut, bad_cut, Cut { stepdown: b, ..good_cut }] {
             for tl in [&t, &tool(6.0)] {
@@ -893,10 +1470,16 @@ fn hostile_values_are_errors_never_panics() {
                 let _ = pocket(
                     &regions,
                     tl,
-                    &PocketParams { stepover: 2.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false },
+                    &PocketParams { stepover: 2.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: None },
                     &c,
                 );
                 let _ = contour(&regions, tl, &contour_params, &c);
+                let _ = engrave(&[chain(&[(0.0, 0.0), (b, b), (1.0, b)], false)], tl, &EngraveParams { tolerance: b }, &c);
+                let _ = drill(&[hole(b, b, -b), hole(0.0, 0.0, b)], tl, &DrillParams { peck: Some(b), dwell: b }, &c);
+                let _ = vcarve(&regions, &vbit(b, 6.0), &VCarveParams { stepover: b, tolerance: b }, &c);
+                let _ = pocket(&regions, tl, &PocketParams { rest: Some(Rest { radius: b, wall: b }), ..pocket_params }, &c);
+                let _ = contour(&regions, tl, &ContourParams { rest: Some(Rest { radius: b, wall: b }), ..contour_params }, &c);
+                let _ = vcarve(&regions, &vbit(60.0, 6.0), &VCarveParams { stepover: 0.5, tolerance: 0.01 }, &c);
             }
         }
         let moves = vec![
@@ -920,7 +1503,7 @@ fn hostile_values_are_errors_never_panics() {
         pocket(
             &regions,
             &tool(6.0),
-            &PocketParams { stepover: 1e-9, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false },
+            &PocketParams { stepover: 1e-9, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: None },
             &good_cut
         )
         .is_err()
@@ -929,7 +1512,7 @@ fn hostile_values_are_errors_never_panics() {
         pocket(
             &regions,
             &tool(60.0),
-            &PocketParams { stepover: 2.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false },
+            &PocketParams { stepover: 2.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: None },
             &good_cut
         )
         .is_err()
@@ -938,7 +1521,7 @@ fn hostile_values_are_errors_never_panics() {
         pocket(
             &[],
             &tool(6.0),
-            &PocketParams { stepover: 2.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false },
+            &PocketParams { stepover: 2.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: None },
             &good_cut
         )
         .is_err()
@@ -946,9 +1529,18 @@ fn hostile_values_are_errors_never_panics() {
     // A drill cuts only at its point: no contour or pocket with one.
     let drill = Tool::new(4, ToolKind::Drill, 6.0, 30.0);
     let square = [rect(0.0, 0.0, 20.0, 20.0)];
-    let side = ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones: false };
+    let side = ContourParams {
+        side: Side::Outside,
+        climb: true,
+        stock_to_leave: 0.0,
+        tolerance: 0.01,
+        ramp_angle: 0.0,
+        tabs: None,
+        dogbones: false,
+        rest: None,
+    };
     assert!(contour(&square, &drill, &side, &good_cut).unwrap_err().to_string().contains("a drill cannot mill"));
-    let lanes = PocketParams { stepover: 2.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false };
+    let lanes = PocketParams { stepover: 2.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: None };
     assert!(pocket(&square, &drill, &lanes, &good_cut).is_err());
     let open = Region2 { outer: Loop2 { segs: rect(0.0, 0.0, 10.0, 10.0).outer.segs.into_iter().take(3).collect() }, holes: vec![] };
     assert!(offset_regions(&[open], 1.0, 0.01).is_err());

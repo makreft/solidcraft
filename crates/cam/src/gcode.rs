@@ -303,7 +303,7 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
         values.tool = op.tool.number.to_string();
         values.diameter = number(op.tool.diameter / post.units.mm(), post.decimals);
         values.rpm = speed.clone();
-        w.comment(&format!("{}: T{} D{} {}", op.name, op.tool.number, number(op.tool.diameter, 3), op.tool.kind.label()));
+        w.comment(&format!("{}: T{} D{} {}", op.name, op.tool.number, number(op.tool.diameter, 3), op.tool.describe()));
         if tool != Some(op.tool.number) {
             if tool.is_some() || post.tool_change_first {
                 w.template(&post.tool_change, &values)?;

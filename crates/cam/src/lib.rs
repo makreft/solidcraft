@@ -1,5 +1,6 @@
 //! Manufacturing (CAM) foundation for SolidCraft: cutting tools, toolpaths, 2D contour and
-//! pocket milling of planar regions, G-code output through declarative post processors, and a
+//! pocket milling of planar regions, engraving along curves, v-carving, drilling, a stock
+//! simulation, G-code output through declarative post processors, and a
 //! G-code reader that checks what was written against the toolpaths it was written from.
 //!
 //! Everything here works in a setup's work coordinates: millimetres, tool axis along +Z, feeds
@@ -14,6 +15,8 @@
 #![forbid(unsafe_code)]
 
 mod check;
+mod drill;
+mod engrave;
 mod gcode;
 mod offset;
 mod ops;
@@ -21,16 +24,22 @@ mod path;
 mod piece;
 mod post;
 mod readback;
+mod simulate;
 mod tool;
+mod vcarve;
 
 pub use check::verify;
+pub use drill::{DrillParams, Hole, MAX_HOLES, drill};
+pub use engrave::{Chain, EngraveParams, MAX_CHAIN_POINTS, MAX_CHAINS, engrave, join_chains};
 pub use gcode::{Operation, Program, emit, parse, work_offset_code};
 pub use offset::offset_regions;
-pub use ops::{ContourParams, Cut, Feeds, Heights, PocketParams, Side, Tabs, contour, pocket};
+pub use ops::{ContourParams, Cut, Feeds, Heights, PocketParams, Rest, Side, Tabs, contour, pocket};
 pub use path::{Move, PathStats, Toolpath, arc_sweep};
 pub use post::{CommentStyle, LineNumbers, Post, SpindleRange, Travel, Units};
 pub use readback::{Readback, allowed_deviation, readback};
+pub use simulate::{Heightmap, MAX_PIXELS};
 pub use tool::{Tool, ToolKind};
+pub use vcarve::{VCarve, VCarveParams, vcarve};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CamError {
@@ -44,6 +53,9 @@ pub enum CamError {
     /// bottom). Operations check their own output, so this reports a defect rather than bad input.
     #[error("unsafe toolpath: {0}")]
     Unsafe(String),
+    /// An operation with nothing to do: rest machining after a tool that reached everywhere.
+    #[error("nothing to cut: {0}")]
+    Nothing(String),
     #[error("G-code line {0}: {1}")]
     Parse(usize, String),
 }

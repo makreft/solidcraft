@@ -1,8 +1,8 @@
-//! CAM setups persisted on the design: tools, setups and 2D milling operations.
+//! CAM setups persisted on the design: tools, setups and 2D milling and engraving operations.
 //! Toolpaths are never stored; they are computed when posting (`cam.post`).
 
 use serde::{Deserialize, Serialize};
-use solidcraft_cam::{ContourParams, Cut, Feeds, Heights, PocketParams, Post, Side, Tool};
+use solidcraft_cam::{Chain, ContourParams, Cut, DrillParams, EngraveParams, Feeds, Heights, Hole, PocketParams, Post, Side, Tool, VCarveParams};
 use solidcraft_geom::{Loop2, Region2, Vec2};
 
 use crate::{DocError, Result};
@@ -21,6 +21,10 @@ pub const MAX_LOOP_POINTS: usize = 10_000;
 pub const MAX_HOLES: usize = 1_000;
 /// Most regions in one operation.
 pub const MAX_REGIONS: usize = 256;
+/// Most curves in one engraving.
+pub const MAX_CHAINS: usize = solidcraft_cam::MAX_CHAINS;
+/// Most holes in one drilling operation.
+pub const MAX_DRILL_HOLES: usize = solidcraft_cam::MAX_HOLES;
 
 /// The design's CAM data: tools, setups and optional named posts.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -210,7 +214,54 @@ fn validate_loop(pts: &[[f64; 2]], label: &str) -> Result<()> {
     Ok(())
 }
 
-/// A 2D milling operation whose geometry is planar polygons in work coordinates.
+/// A curve to engrave: the points of its polyline in work coordinates (mm), open or closed back
+/// to its first point.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PolylineChain {
+    pub points: Vec<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed: bool,
+}
+
+impl PolylineChain {
+    pub fn validate(&self) -> Result<()> {
+        let least = if self.closed { 3 } else { 2 };
+        if self.points.len() < least || self.points.len() > MAX_LOOP_POINTS {
+            return Err(DocError::Invalid(format!("a curve to engrave needs {least} to {MAX_LOOP_POINTS} points")));
+        }
+        if self.points.iter().any(|p| !p[0].is_finite() || !p[1].is_finite() || p[0].abs() > 1.0e6 || p[1].abs() > 1.0e6) {
+            return Err(DocError::Invalid("a curve to engrave has non-finite or huge coordinates".into()));
+        }
+        Ok(())
+    }
+
+    pub fn to_chain(&self) -> Chain {
+        Chain { points: self.points.iter().map(|p| Vec2::new(p[0], p[1])).collect(), closed: self.closed }
+    }
+}
+
+/// One hole to drill: where (work XY, mm) and how deep its bottom is (work Z).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HolePoint {
+    pub at: [f64; 2],
+    pub bottom: f64,
+}
+
+impl HolePoint {
+    pub fn validate(&self) -> Result<()> {
+        let fine = |v: f64| v.is_finite() && v.abs() <= 1.0e6;
+        if !fine(self.at[0]) || !fine(self.at[1]) || !fine(self.bottom) {
+            return Err(DocError::Invalid("a hole has non-finite or huge coordinates".into()));
+        }
+        Ok(())
+    }
+
+    pub fn to_hole(&self) -> Hole {
+        Hole { at: Vec2::new(self.at[0], self.at[1]), bottom: self.bottom }
+    }
+}
+
+/// A 2D operation whose geometry is planar polygons (or polyline curves, or holes) in work coordinates.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CamOperation {
@@ -224,6 +275,9 @@ pub enum CamOperation {
         spindle_rpm: Option<f64>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         coolant: bool,
+        /// The operation whose larger tool went first, when this one is rest machining.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rest_from: Option<String>,
     },
     Pocket {
         name: String,
@@ -235,25 +289,97 @@ pub enum CamOperation {
         spindle_rpm: Option<f64>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         coolant: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rest_from: Option<String>,
+    },
+    /// The tool centre follows curves, open or closed, at fixed depth passes.
+    Engrave {
+        name: String,
+        tool: u32,
+        chains: Vec<PolylineChain>,
+        params: EngraveParams,
+        cut: Cut,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spindle_rpm: Option<f64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        coolant: bool,
+    },
+    /// A V-bit along the inward offsets of the regions, each as deep as the cone touches the
+    /// wall there, never below `cut.heights.bottom` (where the tip clears a flat floor).
+    VCarve {
+        name: String,
+        tool: u32,
+        regions: Vec<PolygonRegion>,
+        params: VCarveParams,
+        cut: Cut,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spindle_rpm: Option<f64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        coolant: bool,
+    },
+    /// Straight down at every hole, each to its own bottom; `cut.heights.bottom` is the deepest.
+    Drill {
+        name: String,
+        tool: u32,
+        holes: Vec<HolePoint>,
+        params: DrillParams,
+        cut: Cut,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spindle_rpm: Option<f64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        coolant: bool,
     },
 }
 
 impl CamOperation {
     pub fn name(&self) -> &str {
         match self {
-            CamOperation::Contour { name, .. } | CamOperation::Pocket { name, .. } => name,
+            CamOperation::Contour { name, .. }
+            | CamOperation::Pocket { name, .. }
+            | CamOperation::Engrave { name, .. }
+            | CamOperation::VCarve { name, .. }
+            | CamOperation::Drill { name, .. } => name,
         }
     }
 
     pub fn tool(&self) -> u32 {
         match self {
-            CamOperation::Contour { tool, .. } | CamOperation::Pocket { tool, .. } => *tool,
+            CamOperation::Contour { tool, .. }
+            | CamOperation::Pocket { tool, .. }
+            | CamOperation::Engrave { tool, .. }
+            | CamOperation::VCarve { tool, .. }
+            | CamOperation::Drill { tool, .. } => *tool,
         }
     }
 
     pub fn cut(&self) -> &Cut {
         match self {
-            CamOperation::Contour { cut, .. } | CamOperation::Pocket { cut, .. } => cut,
+            CamOperation::Contour { cut, .. }
+            | CamOperation::Pocket { cut, .. }
+            | CamOperation::Engrave { cut, .. }
+            | CamOperation::VCarve { cut, .. }
+            | CamOperation::Drill { cut, .. } => cut,
+        }
+    }
+
+    /// The spindle speed the operation asks for (rev/min), if not the tool's.
+    pub fn spindle_rpm(&self) -> Option<f64> {
+        match self {
+            CamOperation::Contour { spindle_rpm, .. }
+            | CamOperation::Pocket { spindle_rpm, .. }
+            | CamOperation::Engrave { spindle_rpm, .. }
+            | CamOperation::VCarve { spindle_rpm, .. }
+            | CamOperation::Drill { spindle_rpm, .. } => *spindle_rpm,
+        }
+    }
+
+    pub fn coolant(&self) -> bool {
+        match self {
+            CamOperation::Contour { coolant, .. }
+            | CamOperation::Pocket { coolant, .. }
+            | CamOperation::Engrave { coolant, .. }
+            | CamOperation::VCarve { coolant, .. }
+            | CamOperation::Drill { coolant, .. } => *coolant,
         }
     }
 
@@ -262,47 +388,65 @@ impl CamOperation {
         if name.is_empty() || name.len() > 128 {
             return Err(DocError::Invalid("a CAM operation name must be 1 to 128 characters".into()));
         }
-        let (regions, cut, spindle) = match self {
-            CamOperation::Contour { regions, cut, spindle_rpm, params, .. } => {
-                if !(params.stock_to_leave >= 0.0) || !params.stock_to_leave.is_finite() {
-                    return Err(DocError::Invalid("stock_to_leave must be ≥ 0".into()));
-                }
-                if !(params.tolerance > 0.0) || !params.tolerance.is_finite() {
-                    return Err(DocError::Invalid("tolerance must be above 0".into()));
-                }
-                if !(params.ramp_angle >= 0.0) || !params.ramp_angle.is_finite() {
-                    return Err(DocError::Invalid("ramp_angle must be ≥ 0 radians".into()));
-                }
-                (regions, cut, *spindle_rpm)
+        let positive = |what: &str, v: f64| if v > 0.0 && v.is_finite() { Ok(()) } else { Err(DocError::Invalid(format!("{what} must be above 0"))) };
+        let not_negative =
+            |what: &str, v: f64| if v >= 0.0 && v.is_finite() { Ok(()) } else { Err(DocError::Invalid(format!("{what} must be ≥ 0"))) };
+        let regions = match self {
+            CamOperation::Contour { regions, params, .. } => {
+                not_negative("stock_to_leave", params.stock_to_leave)?;
+                positive("tolerance", params.tolerance)?;
+                not_negative("ramp_angle", params.ramp_angle).map_err(|_| DocError::Invalid("ramp_angle must be ≥ 0 radians".into()))?;
+                Some(regions)
             }
-            CamOperation::Pocket { regions, cut, spindle_rpm, params, .. } => {
-                if !(params.stepover > 0.0) || !params.stepover.is_finite() {
-                    return Err(DocError::Invalid("stepover must be above 0".into()));
+            CamOperation::Pocket { regions, params, .. } => {
+                positive("stepover", params.stepover)?;
+                not_negative("stock_to_leave", params.stock_to_leave)?;
+                positive("tolerance", params.tolerance)?;
+                not_negative("ramp_angle", params.ramp_angle).map_err(|_| DocError::Invalid("ramp_angle must be ≥ 0 radians".into()))?;
+                Some(regions)
+            }
+            CamOperation::VCarve { regions, params, .. } => {
+                positive("stepover", params.stepover)?;
+                positive("tolerance", params.tolerance)?;
+                Some(regions)
+            }
+            CamOperation::Engrave { chains, params, .. } => {
+                positive("tolerance", params.tolerance)?;
+                if chains.is_empty() || chains.len() > MAX_CHAINS {
+                    return Err(DocError::Invalid(format!("an engraving needs 1 to {MAX_CHAINS} curves")));
                 }
-                if !(params.stock_to_leave >= 0.0) || !params.stock_to_leave.is_finite() {
-                    return Err(DocError::Invalid("stock_to_leave must be ≥ 0".into()));
+                for c in chains {
+                    c.validate()?;
                 }
-                if !(params.tolerance > 0.0) || !params.tolerance.is_finite() {
-                    return Err(DocError::Invalid("tolerance must be above 0".into()));
+                None
+            }
+            CamOperation::Drill { holes, params, .. } => {
+                if let Some(peck) = params.peck {
+                    positive("peck", peck)?;
                 }
-                if !(params.ramp_angle >= 0.0) || !params.ramp_angle.is_finite() {
-                    return Err(DocError::Invalid("ramp_angle must be ≥ 0 radians".into()));
+                not_negative("dwell", params.dwell)?;
+                if holes.is_empty() || holes.len() > MAX_DRILL_HOLES {
+                    return Err(DocError::Invalid(format!("a drilling needs 1 to {MAX_DRILL_HOLES} holes")));
                 }
-                (regions, cut, *spindle_rpm)
+                for h in holes {
+                    h.validate()?;
+                }
+                None
             }
         };
-        if regions.is_empty() || regions.len() > MAX_REGIONS {
-            return Err(DocError::Invalid(format!("an operation needs 1 to {MAX_REGIONS} regions")));
+        if let Some(regions) = regions {
+            if regions.is_empty() || regions.len() > MAX_REGIONS {
+                return Err(DocError::Invalid(format!("an operation needs 1 to {MAX_REGIONS} regions")));
+            }
+            for r in regions {
+                r.validate()?;
+            }
         }
-        for r in regions {
-            r.validate()?;
-        }
+        let cut = self.cut();
         cut.heights.validate().map_err(|e| DocError::Invalid(e.to_string()))?;
         cut.feeds.validate().map_err(|e| DocError::Invalid(e.to_string()))?;
-        if !(cut.stepdown > 0.0) || !cut.stepdown.is_finite() {
-            return Err(DocError::Invalid("stepdown must be above 0".into()));
-        }
-        if let Some(rpm) = spindle
+        positive("stepdown", cut.stepdown)?;
+        if let Some(rpm) = self.spindle_rpm()
             && (!(rpm > 0.0) || !rpm.is_finite() || rpm > 1.0e6)
         {
             return Err(DocError::Invalid("spindle_rpm must be above 0".into()));
@@ -313,12 +457,22 @@ impl CamOperation {
 
 /// Default contour params for a new operation.
 pub fn default_contour_params() -> ContourParams {
-    ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones: false }
+    ContourParams { side: Side::Outside, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, tabs: None, dogbones: false, rest: None }
 }
 
 /// Default pocket params; `stepover` must still be set by the caller.
 pub fn default_pocket_params(stepover: f64) -> PocketParams {
-    PocketParams { stepover, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false }
+    PocketParams { stepover, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, dogbones: false, rest: None }
+}
+
+/// Default v-carving params: passes a tenth of a millimetre apart.
+pub fn default_vcarve_params() -> VCarveParams {
+    VCarveParams { stepover: 0.1, tolerance: 0.01 }
+}
+
+/// Default engraving params: ends within a hundredth of a millimetre are one curve.
+pub fn default_engrave_params() -> EngraveParams {
+    EngraveParams { tolerance: 0.01 }
 }
 
 /// Default cut: clearance 10, retract 2, top 0, bottom `bottom`, feeds 600/200, stepdown from depth.
@@ -340,5 +494,20 @@ mod tests {
     #[test]
     fn empty_settings_skip_serialize() {
         assert!(CamSettings::default().is_empty());
+    }
+
+    #[test]
+    fn a_chain_to_engrave_needs_enough_finite_points_and_reads_back_without_its_closed_flag() {
+        let open = PolylineChain { points: vec![[0.0, 0.0], [10.0, 0.0]], closed: false };
+        open.validate().unwrap();
+        assert!(PolylineChain { points: vec![[0.0, 0.0]], closed: false }.validate().is_err());
+        assert!(PolylineChain { points: vec![[0.0, 0.0], [10.0, 0.0]], closed: true }.validate().is_err(), "closed needs three");
+        assert!(PolylineChain { points: vec![[0.0, 0.0], [f64::NAN, 0.0]], closed: false }.validate().is_err());
+        // Saved without `closed` when open, and read back the same.
+        let text = serde_json::to_string(&open).unwrap();
+        assert!(!text.contains("closed"), "{text}");
+        assert_eq!(serde_json::from_str::<PolylineChain>(&text).unwrap(), open);
+        let chain = open.to_chain();
+        assert_eq!((chain.points.len(), chain.closed), (2, false));
     }
 }
