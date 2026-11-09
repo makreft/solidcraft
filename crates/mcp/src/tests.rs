@@ -2046,6 +2046,28 @@ fn compact_batch_reply_keeps_changed_bodies_and_created_ids() {
     assert!(rect["sides"].is_object(), "results that are not repeated stay: {r}");
 }
 
+/// A drawing of hundreds of curves comes back with hundreds of ids: a compact reply gives each
+/// long `created` list as a count and its first and last id, the full reply every id.
+#[test]
+fn compact_reply_summarises_long_created_lists() {
+    let mut s = server();
+    let points: Vec<String> = (0..=30).map(|i| format!("{i},{}", i % 2)).collect();
+    let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 10"><polyline points="{}"/></svg>"#, points.join(" "));
+    tool(&mut s, "execute", json!({"command": "sketch.create", "params": {"plane": "XY"}}));
+    let full = tool(&mut s, "execute", json!({"command": "sketch.insert_svg", "params": {"text": svg}}));
+    assert_eq!(full["created"]["curves"].as_array().map(Vec::len), Some(30), "{full}");
+    tool(&mut s, "execute", json!({"command": "sketch.create", "params": {"plane": "XY"}}));
+    let short = tool(&mut s, "execute", json!({"command": "sketch.insert_svg", "params": {"text": svg}, "verbose": false}));
+    let curves = &short["created"]["curves"];
+    assert_eq!(curves["count"], json!(30), "{short}");
+    assert!(
+        curves["first"].as_str().is_some_and(|id| id.starts_with('l')) && curves["last"].as_str().is_some_and(|id| id.starts_with('l')),
+        "{short}"
+    );
+    assert_eq!(short["created"]["points"]["count"], json!(31), "{short}");
+    assert_eq!(short["curves"], json!(30), "the count outside `created` stays: {short}");
+}
+
 /// #531: a product model keeps an optional variant hidden in its default presentation. Hiding
 /// it must survive saving and reopening the design (suppressing it would change the design).
 #[test]

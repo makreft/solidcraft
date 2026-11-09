@@ -133,7 +133,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 json!({
                     "command": string("Command id (see list_commands)"),
                     "params": {"type": "object", "description": "The command's parameters"},
-                    "verbose": {"type": "boolean", "description": "false: omit the full feature body list and sketch ids repeated outside `created`; keep created_bodies, changed_bodies and removed_bodies (default true)"},
+                    "verbose": {"type": "boolean", "description": "false: omit the full feature body list and sketch ids repeated outside `created`, and give a `created` list of more than 20 ids as {count, first, last} (the ids run from the first to the last); keep created_bodies, changed_bodies and removed_bodies (default true)"},
                     "expect": expect_schema(),
                 }),
                 &["command"],
@@ -167,7 +167,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "coalesce_parameters": {"type": "boolean", "description": "Set each run of consecutive plain parameter edits (parameters.change or set_parameter with a name and a value, or changes) together, rebuilding the design once for the run instead of once per edit; a run that is refused goes step by step, naming the refused step. Other steps still see the design up to date. Each step keeps its own result; the run is one undo step (default false)"},
                     "timings": {"type": "boolean", "description": "Add `timings`: [{index, command, ms}] for every step run (the failing one included) and `total_ms` (default false)"},
                     "profile": {"type": "boolean", "description": "Like timings, and each step's `profile`: {boolean_ms, tessellate_ms, other_ms}, its time in kernel booleans, in tessellation and the rest (default false)"},
-                    "verbose": {"type": "boolean", "description": "false: a compact reply. Feature steps leave out the full body list (created_bodies, changed_bodies and removed_bodies stay), sketch steps the ids they repeat outside `created` (default true)"},
+                    "verbose": {"type": "boolean", "description": "false: a compact reply. Feature steps leave out the full body list (created_bodies, changed_bodies and removed_bodies stay), sketch steps the ids they repeat outside `created`, and a `created` list of more than 20 ids becomes {count, first, last} (default true)"},
                     "expect": expect_schema(),
                 }),
                 &["commands"],
@@ -1555,9 +1555,13 @@ fn topology_cylinders(faces: &Value, edges: &Value) -> Value {
         .collect()
 }
 
+/// A `created` list longer than this (a drawing of hundreds of curves) is summarised in a compact
+/// reply: the ids run from the first to the last.
+const COMPACT_LIST: usize = 20;
+
 /// A command's result without what the design already had (`execute` or `batch` with `verbose: false`): a
 /// feature's full body list (its created, changed and removed bodies stay), and the sketch ids
-/// a sketch command repeats outside `created`.
+/// a sketch command repeats outside `created`. Long `created` lists become `{count, first, last}`.
 fn compact(mut v: Value) -> Value {
     let Some(o) = v.as_object_mut() else { return v };
     if o.contains_key("created_bodies") {
@@ -1568,6 +1572,19 @@ fn compact(mut v: Value) -> Value {
             if o.get(k).is_some_and(|x| created.get(k) == Some(x)) {
                 o.remove(k);
             }
+        }
+    }
+    if let Some(created) = o.get_mut("created").and_then(Value::as_object_mut) {
+        for k in ["points", "curves", "constraints", "dimensions", "wires"] {
+            let Some(summary) = created
+                .get(k)
+                .and_then(Value::as_array)
+                .filter(|a| a.len() > COMPACT_LIST)
+                .and_then(|a| Some(json!({"count": a.len(), "first": a.first()?, "last": a.last()?})))
+            else {
+                continue;
+            };
+            created.insert(k.into(), summary);
         }
     }
     v
