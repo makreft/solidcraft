@@ -254,6 +254,29 @@ commands reach any folder. Change the open design only through the SolidCraft to
 Keep answers short."
 );
 
+/// The most of the user's custom instructions (#8220) a session gets, in characters: the
+/// Preferences field takes no more, and a longer text from an edited settings file is cut here.
+pub const INSTRUCTIONS_LIMIT: usize = 4000;
+
+/// [`SYSTEM_NOTE`] with the user's custom instructions (#8220) after it. Blank instructions leave
+/// the note as it is.
+pub fn system_note(instructions: &str) -> String {
+    session_note(instructions, false)
+}
+
+/// The note of a session: [`SYSTEM_NOTE`], or [`SYSTEM_NOTE_COMPUTER`] when the user lets the
+/// agent use the computer (`agent_computer_access`), with the user's custom instructions (#8220)
+/// after it. Blank instructions leave the note as it is.
+pub fn session_note(instructions: &str, computer: bool) -> String {
+    let note = if computer { SYSTEM_NOTE_COMPUTER } else { SYSTEM_NOTE };
+    let text: String = instructions.trim().chars().take(INSTRUCTIONS_LIMIT).collect();
+    let text = text.trim_end();
+    if text.is_empty() {
+        return note.to_string();
+    }
+    format!("{note}\n\nThe user's custom instructions, set in SolidCraft's preferences:\n{text}")
+}
+
 /// The Claude Code adapter's own tools that reach the computer rather than the design: turned off
 /// for the session (`_meta.claudeCode.options.disallowedTools`), so it works through SolidCraft's.
 pub const CLAUDE_DISALLOWED_TOOLS: &[&str] =
@@ -261,11 +284,11 @@ pub const CLAUDE_DISALLOWED_TOOLS: &[&str] =
 
 /// The `session/new` parameters. `init` is the agent's `initialize` reply: agents read the system
 /// note from different places (#9811), and the standard field may only go to an agent offering it.
-/// `computer`: the user lets the agent use the computer (`agent_computer_access`), so its own
-/// tools stay on and the bridge has no folder limits.
-pub fn session_new_params(cwd: &std::path::Path, bridge: Option<&McpBridge>, init: &Value, computer: bool) -> Value {
+/// `note` is the system note ([`session_note`]). `computer`: the user lets the agent use the
+/// computer (`agent_computer_access`), so its own tools stay on and the bridge has no folder limits.
+pub fn session_new_params(cwd: &std::path::Path, bridge: Option<&McpBridge>, init: &Value, note: &str, computer: bool) -> Value {
     let servers: Vec<Value> = bridge.map(|b| b.to_json(computer)).into_iter().collect();
-    let (note, disallowed) = if computer { (SYSTEM_NOTE_COMPUTER, &[][..]) } else { (SYSTEM_NOTE, CLAUDE_DISALLOWED_TOOLS) };
+    let disallowed: &[&str] = if computer { &[] } else { CLAUDE_DISALLOWED_TOOLS };
     let mut meta = json!({
         // The Claude adapter's own key, for its versions without the standard field.
         "systemPrompt": {"append": note},
@@ -409,8 +432,15 @@ pub fn auth_methods(init: &Value) -> Vec<AuthMethod> {
                     let kind = match m.get("type").and_then(Value::as_str) {
                         Some("terminal") => {
                             let meta = m.get("_meta").and_then(|x| x.get("terminal-auth"));
-                            let command = meta.and_then(|t| Some((t.get("command")?.as_str()?.to_string(), strings(t.get("args")))));
-                            AuthKind::Terminal { args: strings(m.get("args")), command }
+                            let mut command = meta.and_then(|t| Some((t.get("command")?.as_str()?.to_string(), strings(t.get("args")))));
+                            let mut args = strings(m.get("args"));
+                            // Vibe's Python launcher can advertise its own path as an argument.
+                            // The configured ACP command already starts Vibe and accepts --setup.
+                            if id == "vibe-setup" && init.pointer("/agentInfo/name").and_then(Value::as_str) == Some("@mistralai/mistral-vibe") {
+                                args = vec!["--setup".into()];
+                                command = None;
+                            }
+                            AuthKind::Terminal { args, command }
                         }
                         Some("env_var") => AuthKind::EnvVar {
                             vars: m
@@ -785,29 +815,31 @@ mod tests {
     #[test]
     fn the_session_gets_the_bridged_mcp_server_without_a_token_or_any_path() {
         let b = McpBridge { cli: "/opt/solidcraft/solidcraft-cli".into(), port: 41234 };
-        let p = session_new_params(std::path::Path::new("/home/u/designs"), Some(&b), &json!({}), false);
+        let p = session_new_params(std::path::Path::new("/home/u/designs"), Some(&b), &json!({}), SYSTEM_NOTE, false);
         let s = &p["mcpServers"][0];
         assert_eq!(s["name"], BRIDGE_NAME);
         assert_eq!(s["args"], json!(["mcp", "--connect", "127.0.0.1:41234"]));
         let text = p.to_string();
         assert!(!text.contains("allow-any-path") && !text.contains("TOKEN") && !text.contains("token"), "{text}");
         assert!(p["_meta"]["claudeCode"]["options"]["disallowedTools"].as_array().is_some_and(|t| t.iter().any(|x| x == "Bash")));
-        assert_eq!(session_new_params(std::path::Path::new("/tmp"), None, &json!({}), false)["mcpServers"], json!([]));
+        assert_eq!(session_new_params(std::path::Path::new("/tmp"), None, &json!({}), SYSTEM_NOTE, false)["mcpServers"], json!([]));
     }
 
     /// #9811: the note goes by the routes an agent's `initialize` reply offers, and the standard
     /// field never goes to an agent that doesn't offer it, as the protocol asks.
     #[test]
     fn the_system_note_takes_every_route_the_agent_offers() {
-        let params = |init: Value| session_new_params(std::path::Path::new("/tmp"), None, &init, false);
-        let standard = json!({"mode": "append", "content": [{"type": "text", "text": SYSTEM_NOTE}]});
+        // With the user's custom instructions (#8220), which go wherever the note goes.
+        let note = system_note("Sketch on XZ with explicit plane vectors.");
+        let params = |init: Value| session_new_params(std::path::Path::new("/tmp"), None, &init, &note, false);
+        let standard = json!({"mode": "append", "content": [{"type": "text", "text": note}]});
 
         let offers_standard = params(json!({"agentCapabilities": {"sessionCapabilities": {"systemPrompt": {}}}}));
         assert_eq!(offers_standard["systemPrompt"], standard);
         assert!(offers_standard["_meta"].get("antigravity").is_none());
 
         let offers_antigravity = params(json!({"agentCapabilities": {"_meta": {"antigravity": {"systemPrompt": {"append": true}}}}}));
-        assert_eq!(offers_antigravity["_meta"]["antigravity"]["systemPrompt"]["append"], SYSTEM_NOTE);
+        assert_eq!(offers_antigravity["_meta"]["antigravity"]["systemPrompt"]["append"], note);
         assert!(offers_antigravity.get("systemPrompt").is_none());
 
         for none in [
@@ -823,7 +855,7 @@ mod tests {
         // Every session keeps the key older Claude adapters read, and the tools they turn off.
         for init in [json!({}), json!({"agentCapabilities": {"sessionCapabilities": {"systemPrompt": {}}}})] {
             let p = params(init);
-            assert_eq!(p["_meta"]["systemPrompt"]["append"], SYSTEM_NOTE);
+            assert_eq!(p["_meta"]["systemPrompt"]["append"], note);
             assert!(p["_meta"]["claudeCode"]["options"]["disallowedTools"].is_array());
         }
     }
@@ -833,7 +865,9 @@ mod tests {
     #[test]
     fn a_session_with_the_computer_keeps_the_agents_tools_and_lifts_the_folder_limits() {
         let b = McpBridge { cli: "/opt/solidcraft/solidcraft-cli".into(), port: 41234 };
-        let p = session_new_params(std::path::Path::new("/home/u"), Some(&b), &json!({}), true);
+        let note = session_note("", true);
+        assert_eq!(note, SYSTEM_NOTE_COMPUTER);
+        let p = session_new_params(std::path::Path::new("/home/u"), Some(&b), &json!({}), &note, true);
         assert_eq!(p["mcpServers"][0]["args"], json!(["mcp", "--connect", "127.0.0.1:41234", "--allow-any-path"]));
         assert_eq!(p["_meta"]["claudeCode"]["options"]["disallowedTools"], json!([]));
         assert_eq!(p["_meta"]["claudeCode"]["options"]["allowDangerouslySkipPermissions"], false);
@@ -844,6 +878,22 @@ mod tests {
             assert!(note.contains(&format!("`{BRIDGE_NAME}` MCP server")));
         }
         assert!(!SYSTEM_NOTE_COMPUTER.contains("Don't use shell"));
+        // The user's custom instructions (#8220) follow this note as they follow the usual one.
+        let custom = session_note("Use M3 screws.", true);
+        assert!(custom.starts_with(SYSTEM_NOTE_COMPUTER) && custom.ends_with("preferences:\nUse M3 screws."), "{custom}");
+    }
+
+    /// #8220: the user's custom instructions follow the note, trimmed and cut at the limit; blank
+    /// ones leave the note as it is.
+    #[test]
+    fn custom_instructions_follow_the_note_trimmed_and_capped() {
+        assert_eq!(system_note(""), SYSTEM_NOTE);
+        assert_eq!(system_note(" \n\t "), SYSTEM_NOTE);
+        let note = system_note("\n  Use M3 screws.\nPrint flat side down.  \n");
+        assert!(note.starts_with(SYSTEM_NOTE), "{note}");
+        assert!(note.ends_with("preferences:\nUse M3 screws.\nPrint flat side down."), "{note}");
+        let note = system_note(&"ż".repeat(INSTRUCTIONS_LIMIT + 10));
+        assert_eq!(note.chars().filter(|c| *c == 'ż').count(), INSTRUCTIONS_LIMIT);
     }
 
     /// #5546: an agent started through `wsl.exe` gets the session's paths as WSL shows them.
@@ -866,10 +916,30 @@ mod tests {
         assert_eq!(wsl(r"\\server\share\x"), r"\\server\share\x");
 
         let b = McpBridge { cli: r"C:\Program Files\SolidCraft\solidcraft-cli.exe".into(), port: 41234 };
-        let p = session_new_params(&wsl_path(std::path::Path::new(r"C:\Users\u\work")), Some(&b.in_wsl()), &json!({}), false);
+        let p = session_new_params(&wsl_path(std::path::Path::new(r"C:\Users\u\work")), Some(&b.in_wsl()), &json!({}), SYSTEM_NOTE, false);
         assert_eq!(p["cwd"], "/mnt/c/Users/u/work");
         assert_eq!(p["mcpServers"][0]["command"], "/mnt/c/Program Files/SolidCraft/solidcraft-cli.exe");
         assert_eq!(p["mcpServers"][0]["args"], json!(["mcp", "--connect", "127.0.0.1:41234"]));
+    }
+
+    #[test]
+    fn vibe_terminal_setup_uses_the_configured_acp_launcher() {
+        let mut init = json!({
+            "agentInfo": {"name": "@mistralai/mistral-vibe"},
+            "authMethods": [{
+                "id": "vibe-setup", "type": "terminal", "name": "Register your API Key",
+                "args": [r"C:\Program Files\Vibe\vibe-acp", "--setup"],
+                "_meta": {"terminal-auth": {"command": "python.exe", "args": [r"C:\Program Files\Vibe\vibe-acp", "--setup"]}}
+            }]
+        });
+        let methods = auth_methods(&init);
+        assert_eq!(methods[0].kind, AuthKind::Terminal { args: vec!["--setup".into()], command: None });
+
+        init["agentInfo"]["name"] = json!("another-agent");
+        let methods = auth_methods(&init);
+        let AuthKind::Terminal { args, command } = &methods[0].kind else { panic!("terminal method expected") };
+        assert_eq!(args, &[r"C:\Program Files\Vibe\vibe-acp", "--setup"]);
+        assert!(command.is_some());
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //! back (the subset `emit` writes), which is how the output is checked.
 
 use serde::{Deserialize, Serialize};
-use solidcraft_geom::{Vec2, Vec3};
+use solidcore_record::{Vec2, Vec3};
+use solidcraft_geom::prelude::*;
 
 use crate::path::{Move, Toolpath, arc_sweep};
 use crate::post::{CommentStyle, Post, Values, fill};
@@ -118,7 +119,7 @@ impl Writer<'_> {
     }
 
     /// A `G0`/`G1` block for the axes among `xy` and `z` that change; nothing if none does.
-    /// The word of motion code `n` (0–3): `G1`, or `G01` for a post that pads its codes.
+    /// The word of motion code `n` (0 to 3): `G1`, or `G01` for a post that pads its codes.
     fn motion(&self, n: u8) -> String {
         if self.post.two_digit_codes { format!("G{n:02}") } else { format!("G{n}") }
     }
@@ -386,7 +387,7 @@ fn words(line: &str, n: usize) -> Result<Vec<(char, f64)>> {
     Ok(out)
 }
 
-/// Reads the motion of a G-code program in absolute coordinates: `G0`–`G3` with `X Y Z I J F`,
+/// Reads the motion of a G-code program in absolute coordinates: `G0` to `G3` with `X Y Z I J F`,
 /// `G4 P`, `G20`/`G21`. Everything else (spindle, tools, coolant, offsets) is skipped. The
 /// result is in millimetres and mm/min.
 pub fn parse(text: &str) -> Result<Vec<Move>> {

@@ -2,6 +2,7 @@
 //! `solidcraft-cam`. Toolpaths are computed at post time and never stored on the design.
 
 use serde_json::{Value, json};
+use solidcore_record::{Region2, Seg2, Vec2};
 use solidcraft_cam::{
     Cut, DrillParams, Feeds, Heightmap, Heights, Operation, Post, Program, Rest, Side, Tabs, Tool, ToolKind, contour, drill, emit, engrave,
     join_chains, pocket, readback, vcarve,
@@ -12,7 +13,7 @@ use solidcraft_doc::cam::{
     PolygonRegion, PolylineChain, StockBox, default_contour_params, default_cut, default_engrave_params, default_pocket_params,
     default_vcarve_params,
 };
-use solidcraft_geom::{Region2, Vec2};
+use solidcraft_geom::prelude::*;
 use solidcraft_sketch::CurveKind;
 
 use super::CommandSpec;
@@ -650,7 +651,7 @@ fn sketch_chains(s: &Session, cmd: &str, p: &Value) -> Result<Vec<PolylineChain>
         let kind_closed =
             matches!(sk.curves[ci].kind, CurveKind::Circle { .. } | CurveKind::Ellipse { .. } | CurveKind::Spline { periodic: true, .. });
         let mut pts: Vec<Vec2> = Vec::new();
-        for seg in sk.exact_pieces(ci) {
+        for seg in sk.exact_pieces(ci).into_iter().flat_map(half_turns) {
             for q in seg.polyline(PROFILE_TOLERANCE) {
                 if !pts.last().is_some_and(|l| l.dist(q) <= 1e-9) {
                     pts.push(q);
@@ -682,6 +683,18 @@ fn sketch_chains(s: &Session, cmd: &str, p: &Value) -> Result<Vec<PolylineChain>
         .zip(closed_flags)
         .map(|(pts, closed)| PolylineChain { points: pts.into_iter().map(|q| [q.x, q.y]).collect(), closed })
         .collect())
+}
+
+/// An arc of more than half a turn (a full circle is one arc) as its two halves, so that the
+/// points of a circle's polyline include the ends of its diameter; any other piece as it is.
+fn half_turns(seg: Seg2) -> Vec<Seg2> {
+    match seg {
+        Seg2::Arc { sweep, .. } if sweep.abs() > std::f64::consts::PI + 1e-9 => {
+            let (a, b) = seg.split_half();
+            vec![a, b]
+        }
+        _ => vec![seg],
+    }
 }
 
 /// Turns `loops` by the quarter turns `rotate` asks for (about the sketch origin) and moves
@@ -854,7 +867,7 @@ fn sketch_regions(s: &Session, cmd: &str, p: &Value) -> Result<Vec<PolygonRegion
     if picked.is_empty() {
         return Err(bad(cmd, "the sketch has no closed profile to cut"));
     }
-    let ring = |lp: &solidcraft_geom::Loop2| -> Result<Vec<Vec2>> {
+    let ring = |lp: &solidcore_record::Loop2| -> Result<Vec<Vec2>> {
         let pts: Vec<Vec2> = lp.polyline(PROFILE_TOLERANCE).into_vec();
         if pts.len() > MAX_LOOP_POINTS {
             return Err(bad(cmd, format!("a profile loop needs more than {MAX_LOOP_POINTS} points within {PROFILE_TOLERANCE} mm")));

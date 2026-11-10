@@ -3,9 +3,10 @@
 //! clockwise. A positive distance moves the boundary into the region (the region shrinks), a
 //! negative one away from it.
 
-use std::f64::consts::{FRAC_PI_2, TAU};
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
-use solidcraft_geom::{Loop2, Region2, Seg2, Vec2};
+use solidcore_record::{Loop2, Region2, Seg2, Vec2};
+use solidcraft_geom::prelude::*;
 
 use crate::piece::{Piece, turn};
 use crate::{CamError, Result, invalid};
@@ -211,7 +212,15 @@ fn loop_pieces(lp: &Loop2, tol: f64) -> Result<Vec<Piece>> {
             }
             Seg2::Arc { center, radius, start, sweep } => {
                 if radius > 1e-9 && sweep.abs() > 1e-12 {
-                    out.push(Piece::Arc { c: center, r: radius, a0: start, sweep });
+                    // A full circle comes as one arc; the offsetting works on arcs of at most
+                    // half a turn, whose ends are apart.
+                    if sweep.abs() > PI + 1e-9 {
+                        let half = sweep * 0.5;
+                        out.push(Piece::Arc { c: center, r: radius, a0: start, sweep: half });
+                        out.push(Piece::Arc { c: center, r: radius, a0: start + half, sweep: half });
+                    } else {
+                        out.push(Piece::Arc { c: center, r: radius, a0: start, sweep });
+                    }
                 }
             }
             _ => {

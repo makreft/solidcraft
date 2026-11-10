@@ -2,7 +2,8 @@
 //! tool drills; a V-bit with a depth of its own at every hole makes halftone dots.
 
 use serde::{Deserialize, Serialize};
-use solidcraft_geom::{Vec2, Vec3};
+use solidcore_record::{Vec2, Vec3};
+use solidcraft_geom::prelude::*;
 
 use crate::ops::{Builder, Cut, MAX_COORD, check_reach};
 use crate::path::{Move, Toolpath};

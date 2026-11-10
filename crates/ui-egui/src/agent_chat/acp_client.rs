@@ -35,9 +35,13 @@ pub struct AcpBackend {
     bridge: Option<acp::McpBridge>,
     /// The agent's `initialize` reply: which routes the system note can take into a session.
     init: Value,
+    /// The user lets the agent use the computer (`agent_computer_access`), as of the next session.
     computer: bool,
     /// Started through wsl.exe: folders are handed over as WSL shows them (#5546).
     wsl: bool,
+    /// The user's custom instructions (#8220): with `computer` they make the system note the
+    /// next session gets ([`acp::session_note`]).
+    instructions: String,
     next_id: u64,
     pending: HashMap<u64, Pending>,
     session: Option<String>,
@@ -69,6 +73,7 @@ impl AcpBackend {
             init: Value::Null,
             computer: ctx.computer,
             wsl,
+            instructions: String::new(),
             next_id: 0,
             pending: HashMap::new(),
             session: None,
@@ -96,7 +101,8 @@ impl AcpBackend {
     fn new_session(&mut self) {
         self.config_pending = None;
         self.pending.retain(|_, request| *request != Pending::SetConfig);
-        let params = acp::session_new_params(&self.cwd, self.bridge.as_ref(), &self.init, self.computer);
+        let note = acp::session_note(&self.instructions, self.computer);
+        let params = acp::session_new_params(&self.cwd, self.bridge.as_ref(), &self.init, &note, self.computer);
         self.request(Pending::SessionNew, "session/new", params);
     }
 
@@ -250,7 +256,7 @@ impl AcpBackend {
         // Drain replies first: an acknowledgement already waiting must keep the connection.
         if self.cancelling.is_some_and(|(_, started)| now.saturating_duration_since(started) >= CANCEL_GRACE) {
             self.proc.shutdown(false);
-            out.push(self.finish_exit(vec![crate::i18n::tr("ui.agent_chat_cancel_timeout").to_string()]));
+            out.push(self.finish_exit(vec![solidcraft_ui_text::tr("ui.agent_chat_cancel_timeout").to_string()]));
         }
         out
     }
@@ -296,6 +302,10 @@ impl ChatBackend for AcpBackend {
     fn set_computer(&mut self, computer: bool, cwd: &std::path::Path) {
         self.computer = computer;
         self.cwd = if self.wsl { acp::wsl_path(cwd) } else { cwd.to_path_buf() };
+    }
+
+    fn set_instructions(&mut self, text: &str) {
+        self.instructions = text.to_string();
     }
 
     fn answer_permission(&mut self, key: u64, option: Option<&str>) {
@@ -362,9 +372,9 @@ pub fn test_agent(argv: &[String], cwd: &std::path::Path) -> Result<String, Test
                     }
                 }
                 Ok(FromAgent::Exited(tail)) => {
-                    return Err(TestError::Other(tail.last().cloned().unwrap_or_else(|| crate::i18n::tr("ui.agent_chat_exited").to_string())));
+                    return Err(TestError::Other(tail.last().cloned().unwrap_or_else(|| solidcraft_ui_text::tr("ui.agent_chat_exited").to_string())));
                 }
-                Err(_) => return Err(TestError::Other(crate::i18n::tr("ui.ai_no_answer").to_string())),
+                Err(_) => return Err(TestError::Other(solidcraft_ui_text::tr("ui.ai_no_answer").to_string())),
             }
         }
     };
@@ -372,10 +382,10 @@ pub fn test_agent(argv: &[String], cwd: &std::path::Path) -> Result<String, Test
     let init = wait_for(&p, 1);
     let session_cwd = if acp::runs_in_wsl(argv) { acp::wsl_path(cwd) } else { cwd.to_path_buf() };
     let result = init.and_then(|v| {
-        p.send(&acp::request(2, "session/new", acp::session_new_params(&session_cwd, None, &v, false)));
+        p.send(&acp::request(2, "session/new", acp::session_new_params(&session_cwd, None, &v, acp::SYSTEM_NOTE, false)));
         wait_for(&p, 2).map(|_| {
             let who = acp::agent_info(&v);
-            crate::i18n::format("ui.ai_test_acp_ok", &[("agent", if who.is_empty() { "?" } else { &who })])
+            solidcraft_ui_text::format("ui.ai_test_acp_ok", &[("agent", if who.is_empty() { "?" } else { &who })])
         })
     });
     p.shutdown(true);

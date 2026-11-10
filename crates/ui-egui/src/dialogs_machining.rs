@@ -134,7 +134,7 @@ pub struct PostForm {
 }
 
 fn tr(text: &str) -> &str {
-    crate::i18n::tr_label(text)
+    solidcraft_ui_text::tr_label(text)
 }
 
 /// The first name `base N` the design's names don't have yet.

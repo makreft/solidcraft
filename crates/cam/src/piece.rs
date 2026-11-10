@@ -3,7 +3,8 @@
 
 use std::f64::consts::TAU;
 
-use solidcraft_geom::{Seg2, Vec2};
+use solidcore_record::{Seg2, Vec2};
+use solidcraft_geom::prelude::*;
 
 /// A parameter within this of 0 or 1 counts as on the piece.
 const PARAM_SLACK: f64 = 1e-9;
@@ -184,7 +185,7 @@ fn arc_param(a0: f64, sweep: f64, theta: f64) -> Option<f64> {
     }
 }
 
-/// Where the segment `a`–`b` meets the circle: `(parameter, point)`.
+/// Where the segment from `a` to `b` meets the circle: `(parameter, point)`.
 fn line_circle(a: Vec2, b: Vec2, c: Vec2, r: f64) -> Vec<(f64, Vec2)> {
     let d = b - a;
     let len = d.len();

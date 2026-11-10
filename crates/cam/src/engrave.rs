@@ -2,7 +2,8 @@
 //! offset, so a curve needs no area: a single line, a lip line, the strokes of a letter.
 
 use serde::{Deserialize, Serialize};
-use solidcraft_geom::Vec2;
+use solidcore_record::Vec2;
+use solidcraft_geom::prelude::*;
 
 use crate::ops::{Builder, Cut, MAX_COORD, check_reach, mills};
 use crate::path::Toolpath;

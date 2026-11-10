@@ -622,6 +622,37 @@ fn release_notes_read_as_markdown() {
     assert_eq!(inline("**[x](y)**"), vec![Span::Strong("x".into())]);
 }
 
+#[test]
+fn a_pipe_table_reads_as_one_entry_per_row() {
+    let md = "## Files\n\n| File | Author | Licence |\n|---|---|---|\n| a.png | `cargo xtask` | MIT |\n| b.svg | | [CC0](https://x/cc0) |\n\nAfter.";
+    let b = parse_markdown(md);
+    let text = |s: &str| vec![Span::Text(s.into())];
+    assert_eq!(b.len(), 5, "{b:?}");
+    assert_eq!(b.get(1), Some(&Block::Row { header: true, cells: vec![text("File"), text("Author"), text("Licence")] }));
+    assert_eq!(b.get(2), Some(&Block::Row { header: false, cells: vec![text("a.png"), vec![Span::Code("cargo xtask".into())], text("MIT")] }));
+    assert_eq!(b.get(4), Some(&Block::Paragraph(text("After."))));
+    // A row reads as its first cell in bold, then the others between dots; an empty cell drops out.
+    let Some(Block::Row { header, cells }) = b.get(3) else { panic!("{b:?}") };
+    assert_eq!(
+        row_spans(cells, *header),
+        vec![Span::Strong("b.svg".into()), Span::Text(" · ".into()), Span::Link { text: "CC0".into(), url: Some("https://x/cc0".into()) }]
+    );
+    let Some(Block::Row { header, cells }) = b.get(1) else { panic!("{b:?}") };
+    assert_eq!(
+        row_spans(cells, *header),
+        vec![
+            Span::Text("File".into()),
+            Span::Text(" · ".into()),
+            Span::Text("Author".into()),
+            Span::Text(" · ".into()),
+            Span::Text("Licence".into())
+        ]
+    );
+    for s in ["|", "||", "|---|", "| a", "|-|-", "| é |"] {
+        let _ = parse_markdown(s);
+    }
+}
+
 /// #2943: a release note's links keep where they go, so the window can open them; only web
 /// addresses are kept (a relative or other link shows as text that opens nothing).
 #[test]
@@ -676,7 +707,7 @@ fn the_version_links_to_its_release_notes() {
 #[test]
 fn unavailable_preferences_show_disabled_update_controls_and_real_values() {
     use egui::accesskit::{Role, Toggled};
-    let _language = crate::i18n::scope("en");
+    let _language = solidcraft_ui_text::scope("en");
     for kind in [InstallKind::Dev, InstallKind::Web, InstallKind::Flatpak("io.solidcraft.SolidCraft".into())] {
         for checked in [false, true] {
             let mut h = crate::scenario::Harness::new();
@@ -704,7 +735,7 @@ fn unavailable_preferences_show_disabled_update_controls_and_real_values() {
                     assert_eq!(controls[0].1.toggled(), Some(if checked { Toggled::True } else { Toggled::False }));
                 }
             }
-            let reason = crate::i18n::tr("update.check_unavailable");
+            let reason = solidcraft_ui_text::tr("update.check_unavailable");
             assert_eq!(tree.nodes.iter().filter(|(_, node)| node.role() == Role::Label && node.value() == Some(reason)).count(), 1);
             let texts: Vec<_> = h
                 .shapes
@@ -714,11 +745,12 @@ fn unavailable_preferences_show_disabled_update_controls_and_real_values() {
             assert!(texts.contains(&reason), "{kind:?}: the unavailable reason is painted");
             assert!(h.widget("Up to date").is_none(), "unavailability is not a successful check");
             let note = match &kind {
-                InstallKind::Web => crate::i18n::tr("update.prefs_web").to_string(),
-                InstallKind::Flatpak(id) => {
-                    crate::i18n::format("update.prefs_flatpak", &[("version", current_version()), ("command", &format!("flatpak update {id}"))])
-                }
-                _ => crate::i18n::format("update.prefs_dev", &[("version", current_version())]),
+                InstallKind::Web => solidcraft_ui_text::tr("update.prefs_web").to_string(),
+                InstallKind::Flatpak(id) => solidcraft_ui_text::format(
+                    "update.prefs_flatpak",
+                    &[("version", current_version()), ("command", &format!("flatpak update {id}"))],
+                ),
+                _ => solidcraft_ui_text::format("update.prefs_dev", &[("version", current_version())]),
             };
             assert!(
                 tree.nodes.iter().any(|(_, node)| node.role() == Role::Label && node.value() == Some(note.as_str())),
@@ -763,7 +795,7 @@ fn general_updates_show_real_status_and_time_and_check_now_uses_the_existing_fee
             assert_eq!(controls[0].1.toggled(), Some(egui::accesskit::Toggled::False));
         }
     }
-    let checked = crate::i18n::format("prefs.general.last_check", &[("time", &solidcraft_engine::crash::utc(1_700_000_000))]);
+    let checked = solidcraft_ui_text::format("prefs.general.last_check", &[("time", &solidcraft_engine::crash::utc(1_700_000_000))]);
     assert!(h.widget(&checked).is_some(), "the persisted check time is shown");
     let button = crate::scenario::rect_of("prefs:check_now").unwrap();
     h.step(&json!({"click":[button.center().x, button.center().y]})).unwrap();

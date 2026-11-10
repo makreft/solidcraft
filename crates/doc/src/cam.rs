@@ -2,8 +2,8 @@
 //! Toolpaths are never stored; they are computed when posting (`cam.post`).
 
 use serde::{Deserialize, Serialize};
+use solidcore_record::{Loop2, Region2, Vec2};
 use solidcraft_cam::{Chain, ContourParams, Cut, DrillParams, EngraveParams, Feeds, Heights, Hole, PocketParams, Post, Side, Tool, VCarveParams};
-use solidcraft_geom::{Loop2, Region2, Vec2};
 
 use crate::{DocError, Result};
 
@@ -482,6 +482,8 @@ pub fn default_cut(bottom: f64, stepdown: f64) -> Cut {
 
 #[cfg(test)]
 mod tests {
+    use solidcraft_geom::prelude::*;
+
     use super::*;
 
     #[test]

@@ -1,8 +1,8 @@
 //! A design can hold CAM milling data (`cam`: tools, setups with work offset and optional stock,
 //! and 2D contour/pocket operations whose regions are planar polygons in work coordinates).
 //! Toolpaths are never saved; they are computed when posting. Older designs need no
-//! transformation: an absent `cam` field means no setups. The last release refuses a design
-//! saved with this (the newer format number).
+//! transformation: an absent `cam` field means no setups. The last release warns about the newer
+//! format number, opens what it can read and keeps the `cam` data as it is.
 //!
 //! Tools may carry `tip_angle`, `taper_angle` and `tip_diameter`: a V-bit (`kind: vbit`) and a
 //! tapered ball end mill (`kind: tapered_ball`) narrow towards their tip. A tool without them is a

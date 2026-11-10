@@ -4,7 +4,8 @@
 //! the tip clears a flat floor there.
 
 use serde::{Deserialize, Serialize};
-use solidcraft_geom::{Region2, Vec2};
+use solidcore_record::{Region2, Vec2};
+use solidcraft_geom::prelude::*;
 
 use crate::offset::Shape;
 use crate::ops::{Builder, Cut, check_reach, start_near};

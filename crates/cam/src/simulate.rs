@@ -2,7 +2,8 @@
 //! pass, with the tool's own shape (a flat, a ball, a cone). What is left standing shows before
 //! anything is cut.
 
-use solidcraft_geom::{Region2, Vec2, Vec3};
+use solidcore_record::{Region2, Vec2, Vec3};
+use solidcraft_geom::prelude::*;
 
 use crate::path::Toolpath;
 use crate::tool::{Tool, ToolKind};
