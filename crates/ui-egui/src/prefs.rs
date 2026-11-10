@@ -1498,6 +1498,10 @@ preference_settings! {
     /// How much the agent may do without asking (`ask`, `edits`, `all`), and per agent.
     ai_permissions: crate::agent_chat::agents::Mode = crate::agent_chat::agents::Mode::Edits, PAGE_ASSISTANT;
     agent_permissions: std::collections::BTreeMap<String, crate::agent_chat::agents::Mode> = Default::default(), PAGE_ASSISTANT;
+    /// The agent may use this computer (docs/agent-chat.md): Claude Code keeps its own shell, file
+    /// and web tools and starts in the home folder, and SolidCraft's file commands reach any
+    /// folder. Off: it works only through SolidCraft's tools, inside the folder limits (the default).
+    agent_computer_access: bool = false, PAGE_ASSISTANT;
     /// The model last chosen in the chat, per agent: put back when the agent offers it again.
     agent_models: std::collections::BTreeMap<String, String> = Default::default();
     /// "Always allow" answers: per agent, the tools it may use without asking.
@@ -1505,6 +1509,9 @@ preference_settings! {
     /// The side the panel docks on (`left` or `right`), its width, and whether it is folded to a strip.
     agent_chat_side: String = "right".into(), PAGE_ASSISTANT;
     agent_chat_width: f32 = 380.0, PAGE_ASSISTANT;
+    /// The size of the chat's text (its messages and the input) as a factor on the usual sizes;
+    /// also the A− and A+ buttons under the chat's input.
+    agent_chat_text_scale: f32 = 1.0, PAGE_ASSISTANT;
     agent_chat_minimized: bool = false, PAGE_ASSISTANT;
     /// Whether the chat is in its own window instead of the side panel, and that window's place
     /// and size as the system last reported them (`[x, y, width, height]`, points; `x` can be

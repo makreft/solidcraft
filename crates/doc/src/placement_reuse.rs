@@ -121,9 +121,11 @@ pub(super) fn local_geometry(f: &Feature, components: &std::collections::HashMap
 }
 
 /// Every non-placement field is named, so a new input requires an explicit decision here.
-/// Assembly records do not feed any of the feature kinds accepted by `local_geometry`.
+/// Assembly records and CAM settings do not feed any of the feature kinds accepted by
+/// `local_geometry`.
 fn same_geometry_inputs(a: &Document, b: &Document) -> bool {
     let Document {
+        cam: _,
         newer_file: _,
         render,
         format,

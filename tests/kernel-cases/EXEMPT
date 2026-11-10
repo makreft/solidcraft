@@ -28,6 +28,18 @@ browser.move                      the browser tree: order, groups and folding
 browser.order                     the browser tree: order, groups and folding
 browser.rename_group              the browser tree: order, groups and folding
 browser.ungroup                   the browser tree: order, groups and folding
+cam.contour                       manufacturing: toolpaths and G-code, tested in crates/cam and cmd/cam.rs
+cam.delete_op                     manufacturing: toolpaths and G-code, tested in crates/cam and cmd/cam.rs
+cam.drill                         manufacturing: toolpaths and G-code, tested in crates/cam and cmd/cam.rs
+cam.engrave                       manufacturing: toolpaths and G-code, tested in crates/cam and cmd/cam.rs
+cam.list                          manufacturing: toolpaths and G-code, tested in crates/cam and cmd/cam.rs
+cam.pocket                        manufacturing: toolpaths and G-code, tested in crates/cam and cmd/cam.rs
+cam.post                          manufacturing: toolpaths and G-code, tested in crates/cam and cmd/cam.rs
+cam.post.define                   manufacturing: toolpaths and G-code, tested in crates/cam and cmd/cam.rs
+cam.setup                         manufacturing: toolpaths and G-code, tested in crates/cam and cmd/cam.rs
+cam.simulate                      manufacturing: toolpaths and G-code, tested in crates/cam and cmd/cam.rs
+cam.tool                          manufacturing: toolpaths and G-code, tested in crates/cam and cmd/cam.rs
+cam.vcarve                        manufacturing: toolpaths and G-code, tested in crates/cam and cmd/cam.rs
 canvas.calibrate                  reference images, and sketches traced from them (sketch only)
 canvas.decal                      reference images, and sketches traced from them (sketch only)
 canvas.delete                     reference images, and sketches traced from them (sketch only)

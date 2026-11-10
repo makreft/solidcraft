@@ -1205,6 +1205,45 @@ fn joins_into_a_moved_occurrence_meet_the_tool_where_it_is_shown() {
     assert!((volume(&s, "C") - want).abs() < 1e-6 * want, "C: {} vs {want}", volume(&s, "C"));
 }
 
+/// A fastener inserted into an assembly, and the joint that seats it, leave every result before
+/// them as it was: a new component, or one moved, is nothing an earlier feature reads. (Each of
+/// them once evaluated every join and cut across components again, minutes in a large design.)
+/// Moving the component an earlier cut reaches into still evaluates that cut again.
+#[test]
+fn a_new_or_moved_component_keeps_the_results_before_it() {
+    let volume = |s: &Session, name: &str| s.model.state().body(name).map(|b| solidcraft_kernel::measure(&b.body).unwrap().volume).unwrap_or(0.0);
+    let states = |s: &Session| s.model.results.iter().map(|r| std::sync::Arc::as_ptr(&r.state)).collect::<Vec<_>>();
+    let mut s = Session::default();
+    created(&mut s, "Part");
+    run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 10, "corner": [-20, -20, 0], "body_name": "Plate"}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    // A hole drilled from the root into the plate of the part.
+    run(
+        &mut s,
+        "solid.cylinder",
+        json!({"diameter": 5.5, "height": 30, "base": [0, 0, -10], "axis": [0, 0, 1], "operation": "cut", "targets": ["Plate"], "name": "Hole"}),
+    );
+    let plate = 40.0 * 40.0 * 10.0 - std::f64::consts::PI * 2.75 * 2.75 * 10.0;
+    assert!((volume(&s, "Plate") - plate).abs() < 1e-3 * plate, "{}", volume(&s, "Plate"));
+    let before = states(&s);
+
+    created(&mut s, "Empty");
+    assert_eq!(s.model.last_recomputed, 0, "a new component evaluates nothing");
+    assert_eq!(states(&s), before);
+    run(&mut s, "component.activate", json!({"component": "root"}));
+
+    let screw = run(&mut s, "parts.insert", json!({"family": "socket_head_cap_screw", "size": "M5", "length": 10, "at": [2.75, 0, 10]}));
+    assert!(screw.get("joint").is_some(), "seated in the hole: {screw}");
+    assert_eq!(&states(&s)[..before.len()], &before[..], "the plate and its hole keep their results");
+    assert!((volume(&s, "Plate") - plate).abs() < 1e-3 * plate);
+
+    // Part moved: the hole, drawn in the root, now meets the plate elsewhere.
+    run(&mut s, "occurrence.move", json!({"occurrence": "Part:1", "translate": [5, 0, 0]}));
+    run(&mut s, "component.capture_position", json!({}));
+    let hole = s.doc.features.iter().position(|f| f.name == "Hole").unwrap();
+    assert_ne!(states(&s)[hole], before[hole], "the cut into the moved part is evaluated again");
+}
+
 #[test]
 fn component_delete_removes_joints_to_its_occurrences_and_undo_restores_them() {
     let mut s = Session::default();

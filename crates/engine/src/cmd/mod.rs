@@ -22,6 +22,7 @@ macro_rules! planned {
 
 mod bom;
 pub(crate) mod browser;
+mod cam;
 pub(crate) mod clearance;
 mod clipboard;
 mod clipboard_foreign;
@@ -40,6 +41,10 @@ mod face;
 mod features;
 mod features_more;
 mod join_pieces;
+pub(crate) use cam::{
+    drill_point as cam_drill_point, outline_holes as cam_outline_holes, parse_side as cam_side, path_chain as cam_path_chain,
+    polygon_region as cam_polygon_region, stock_box as cam_stock_box, tabs_param as cam_tabs_param, tool_kind as cam_tool_kind,
+};
 pub(crate) use construct::{GeoForm, GeoFormError, REF as GEO_REF_FORMS, SKETCH_PART, geo_form, is_model_axis, plane_axis_point_kind};
 pub(crate) use face::{FaceRefForm, face_ref_form};
 pub(crate) use features::profiles as feature_profiles;
@@ -349,6 +354,7 @@ pub fn command_specs() -> Vec<&'static CommandSpec> {
     v.extend(construct::COMMANDS.iter());
     v.extend(sheet::COMMANDS.iter());
     v.extend(plastic::COMMANDS.iter());
+    v.extend(cam::COMMANDS.iter());
     v.extend(frame::COMMANDS.iter());
     v.extend(frame_end_cap::COMMANDS.iter());
     v.extend(component::COMMANDS.iter());

@@ -4294,6 +4294,17 @@ name = "solidcraft-3dx-client"
 version = "0.40.0-rc.3"
 
 [[package]]
+name = "solidcraft-cam"
+version = "0.40.0-rc.3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "solidcore-record",
+ "solidcraft-geom",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "solidcraft-cli"
 version = "0.40.0-rc.3"
 dependencies = [
@@ -4351,6 +4362,7 @@ dependencies = [
  "sha2 0.10.9",
  "solidcore-record",
  "solidcore-tess",
+ "solidcraft-cam",
  "solidcraft-color",
  "solidcraft-derive",
  "solidcraft-geom",
@@ -4385,6 +4397,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "solidcore-record",
+ "solidcraft-cam",
  "solidcraft-color",
  "solidcraft-control",
  "solidcraft-doc",

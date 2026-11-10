@@ -14,6 +14,8 @@ use solidcraft_theme::Tokens;
 
 pub const MIN_WIDTH: f32 = 280.0;
 pub const MAX_WIDTH: f32 = 760.0;
+/// The text sizes the chat offers, as factors on the usual sizes.
+pub(super) const TEXT_SCALE: std::ops::RangeInclusive<f32> = 0.7..=2.0;
 /// The folded panel's width.
 const STRIP: f32 = 30.0;
 
@@ -122,6 +124,8 @@ pub enum PanelAction {
     OpenSettings,
     /// Preferences, adding an agent.
     AddAgent,
+    /// The chat's text size, as a factor on the usual sizes (the A- and A+ buttons).
+    SetTextScale(f32),
 }
 
 /// Run one thing the panel recorded.
@@ -185,6 +189,7 @@ pub fn run(app: &mut SolveApp, ctx: &egui::Context, action: PanelAction) {
         }
         PanelAction::OpenSettings => crate::prefs::open_at(app, crate::prefs::PAGE_ASSISTANT),
         PanelAction::AddAgent => super::settings::open_add(app),
+        PanelAction::SetTextScale(scale) => app.preferences.agent_chat_text_scale = text_scale(scale),
     }
 }
 
@@ -226,6 +231,9 @@ pub struct PanelView {
     pub dialog_open: bool,
     /// Changes allowed in one turn (0: no limit).
     pub turn_limit: u32,
+    /// The size of the chat's text (its messages and the input) as a factor on the usual sizes,
+    /// within [`TEXT_SCALE`].
+    pub text_scale: f32,
     /// Why the chosen model may not work, if it may not.
     pub model_warning: Option<String>,
     /// The chat buttons' tooltip: name and shortcut.
@@ -264,6 +272,7 @@ impl PanelView {
             selected: selected_count(app),
             dialog_open: app.dialog.is_some(),
             turn_limit: app.preferences.agent_chat_turn_limit,
+            text_scale: text_scale(app.preferences.agent_chat_text_scale),
             model_warning: settings::model_warning(app),
             tip: tip(app),
             toggle_keys: crate::keymap::keys(app, "ui.assistant"),
@@ -1046,7 +1055,8 @@ pub fn take_focus_for_text(popped: bool, over_text: bool, chat_active: Option<bo
     popped && over_text && chat_active == Some(false) && main_active == Some(true)
 }
 
-/// A small drawn button: `kind` is `minimize`, `close`, `newchat`, `stopturn`, `pop_out` or `dock`.
+/// A small drawn button: `kind` is `minimize`, `close`, `newchat`, `stopturn`, `pop_out`, `dock`,
+/// `text_smaller` or `text_bigger`.
 fn glyph_button(ui: &mut egui::Ui, kind: &str, tip: &str) -> egui::Response {
     let t = Tokens::get();
     let (r, resp) = ui.allocate_exact_size(vec2(t.form_close_size, t.form_close_size), Sense::click());
@@ -1087,6 +1097,12 @@ fn glyph_button(ui: &mut egui::Ui, kind: &str, tip: &str) -> egui::Response {
         }
         "stopturn" => {
             ui.painter().rect_filled(Rect::from_center_size(c, vec2(9.0, 9.0)), 1.5, t.error);
+        }
+        // A letter A with a minus or a plus: smaller or bigger text.
+        "text_smaller" | "text_bigger" => {
+            let (size, sign) = if kind == "text_bigger" { (t.font_subtitle, "+") } else { (t.font_small, "−") };
+            p.text(c + vec2(-2.5, 1.0), Align2::CENTER_CENTER, "A", egui::FontId::proportional(size), t.text);
+            p.text(c + vec2(5.5, -3.5), Align2::CENTER_CENTER, sign, egui::FontId::proportional(t.font_micro), t.text);
         }
         _ => {}
     }
@@ -1390,6 +1406,7 @@ fn composer(chat: &mut AgentChat, view: &PanelView, ui: &mut egui::Ui, state: St
     // the box are always in view.
     let edit_max = (ui.available_height() * 0.4).clamp(48.0, 160.0);
     let busy = state == State::Busy;
+    let scale = view.text_scale;
     // Enter sends (queues while the agent works); Ctrl/Cmd+Enter sends now; Esc stops. They are
     // read before the field sees them so no newline is typed.
     let focused = ui.memory(|m| m.has_focus(Id::unique("sc_agent_chat_input")));
@@ -1425,12 +1442,14 @@ fn composer(chat: &mut AgentChat, view: &PanelView, ui: &mut egui::Ui, state: St
                     .min_scrolled_height(edit_max)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui_kit::assistant_input(
-                            ui,
-                            Id::unique("sc_agent_chat_input"),
-                            &mut chat.input,
-                            tr(if busy { "ui.agent_chat_placeholder_busy" } else { "ui.agent_chat_placeholder" }),
-                        )
+                        crate::theme::with_text_scale(scale, || {
+                            ui_kit::assistant_input(
+                                ui,
+                                Id::unique("sc_agent_chat_input"),
+                                &mut chat.input,
+                                tr(if busy { "ui.agent_chat_placeholder_busy" } else { "ui.agent_chat_placeholder" }),
+                            )
+                        })
                     })
                     .inner;
                 solidcraft_ui_registry::publish_rect("agent_chat:input", r.rect);
@@ -1527,6 +1546,13 @@ fn composer(chat: &mut AgentChat, view: &PanelView, ui: &mut egui::Ui, state: St
                             .backing_on_hover_text(tr("ui.agent_chat_pick_context_tip"));
                         solidcraft_ui_registry::publish_handle("agent_chat:pick_context", picker.rect.center());
                         pick_clicked = picker.clicked();
+                        // Smaller and bigger text in the chat (also Preferences > AI > Panel > Text size).
+                        if glyph_button(ui, "text_smaller", tr("ui.agent_chat_text_smaller")).clicked() {
+                            chat.actions.push(PanelAction::SetTextScale(text_step(scale, -1)));
+                        }
+                        if glyph_button(ui, "text_bigger", tr("ui.agent_chat_text_bigger")).clicked() {
+                            chat.actions.push(PanelAction::SetTextScale(text_step(scale, 1)));
+                        }
                         if let Some(turn) = &chat.turn {
                             let n = turn.changes.to_string();
                             let count = match view.turn_limit {
@@ -1564,9 +1590,14 @@ fn transcript_body(chat: &mut AgentChat, view: &PanelView, ui: &mut egui::Ui) ->
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show(ui, |ui| {
+            // The chat's text size: the text styles here, the theme's font sizes below.
+            let scale = view.text_scale;
+            for font in ui.style_mut().text_styles.values_mut() {
+                font.size *= scale;
+            }
             egui::Frame::NONE.inner_margin(egui::Margin::same(Tokens::get().space_12 as i8)).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = Tokens::get().space_10;
-                conversation(chat, view, ui);
+                crate::theme::with_text_scale(scale, || conversation(chat, view, ui));
             });
             // Last, so the scroll goes to this area and not to one nested in the conversation.
             scroll_while_selecting(ui);
@@ -1593,6 +1624,17 @@ fn finish_composer(chat: &mut AgentChat, outcome: ComposerOutcome) {
         // Nothing typed: Ctrl+Enter sends what is already queued.
         chat.actions.push(PanelAction::SendNow);
     }
+}
+
+/// The chat's text size from the preference: within [`TEXT_SCALE`], and 1 for a value that is
+/// not a number.
+pub(super) fn text_scale(value: f32) -> f32 {
+    if value.is_finite() { value.clamp(*TEXT_SCALE.start(), *TEXT_SCALE.end()) } else { 1.0 }
+}
+
+/// The chat's text size one step (10 %) smaller (`-1`) or bigger (`1`) than `scale`, on whole steps.
+pub(super) fn text_step(scale: f32, dir: i8) -> f32 {
+    text_scale(((scale * 10.0).round() + f32::from(dir)) / 10.0)
 }
 
 /// The header's second row: the agent this conversation uses (a compact switcher), the agent's
@@ -3005,6 +3047,7 @@ mod tests {
             selected: 0,
             dialog_open: false,
             turn_limit: 0,
+            text_scale: 1.0,
             model_warning: None,
             tip: "Assistant".into(),
             toggle_keys: Vec::new(),

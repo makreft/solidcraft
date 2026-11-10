@@ -1500,7 +1500,7 @@ while IFS= read -r line; do
 done
 "#;
     let argv = vec!["sh".to_string(), "-c".to_string(), script.to_string(), "fake-agent".to_string(), log.to_string_lossy().into_owned()];
-    let start = backend::StartContext { cwd: dir.clone(), bridge: None, tools: None, wake: Box::new(|| {}) };
+    let start = backend::StartContext { cwd: dir.clone(), bridge: None, computer: false, tools: None, wake: Box::new(|| {}) };
     let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
     app.agent_chat.backend = Some(Box::new(acp_client::AcpBackend::start(&argv, start).unwrap()));
     app.agent_chat.state = Some(State::Starting);
@@ -1593,7 +1593,7 @@ while IFS= read -r line; do
 done
 "#;
     let argv = vec!["sh".to_string(), "-c".to_string(), script.to_string(), "fake-agent".to_string(), log.to_string_lossy().into_owned()];
-    let start = backend::StartContext { cwd: dir.clone(), bridge: None, tools: None, wake: Box::new(|| {}) };
+    let start = backend::StartContext { cwd: dir.clone(), bridge: None, computer: false, tools: None, wake: Box::new(|| {}) };
     let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
     app.agent_chat.backend = Some(Box::new(acp_client::AcpBackend::start(&argv, start).unwrap()));
     app.agent_chat.state = Some(State::Starting);
@@ -1611,6 +1611,8 @@ done
     until(&mut app, &|a| a.agent_chat.state() == State::Ready);
     assert!(!app.agent_chat.items.is_empty());
     let pid = app.agent_chat.backend.as_ref().and_then(|b| b.pid());
+    // The preference changed while the agent ran: the new session follows it.
+    app.preferences.agent_computer_access = true;
     new_chat(&mut app);
     assert!(app.agent_chat.items.is_empty());
     until(&mut app, &|a| a.agent_chat.state() == State::Ready);
@@ -1622,6 +1624,14 @@ done
         log_text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter_map(|v| v["method"].as_str().map(String::from)).collect();
     assert_eq!(methods, ["initialize", "session/new", "session/prompt", "session/new", "session/prompt"]);
     assert!(log_text.lines().last().is_some_and(|l| l.contains("\"s2\"")), "the prompt goes to the new session: {log_text}");
+    let sessions: Vec<Value> = log_text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["method"] == "session/new")
+        .map(|v| v["params"]["_meta"]["claudeCode"]["options"]["disallowedTools"].clone())
+        .collect();
+    assert!(sessions[0].as_array().is_some_and(|t| t.iter().any(|x| x == "Bash")), "{sessions:?}");
+    assert_eq!(sessions[1], serde_json::json!([]), "the second session may use the computer");
     disconnect(&mut app);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1646,7 +1656,7 @@ while IFS= read -r line; do
 done
 "#;
     let argv = vec!["sh".to_string(), "-c".to_string(), script.to_string(), "fake-agent".to_string(), log.to_string_lossy().into_owned()];
-    let start = backend::StartContext { cwd: dir.clone(), bridge: None, tools: None, wake: Box::new(|| {}) };
+    let start = backend::StartContext { cwd: dir.clone(), bridge: None, computer: false, tools: None, wake: Box::new(|| {}) };
     let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
     app.agent_chat.backend = Some(Box::new(acp_client::AcpBackend::start(&argv, start).unwrap()));
     app.agent_chat.state = Some(State::Starting);
@@ -2567,6 +2577,7 @@ done
     let start = backend::StartContext {
         cwd: dir.clone(),
         bridge: None,
+        computer: false,
         tools: None,
         wake: Box::new(move || {
             let _ = wake_tx.send(());
@@ -2738,7 +2749,7 @@ while IFS= read -r line; do
 done
 "#;
     let argv = vec!["sh".to_string(), "-c".to_string(), script.to_string(), "fake-agent".to_string(), log.to_string_lossy().into_owned()];
-    let start = backend::StartContext { cwd: dir.clone(), bridge: None, tools: None, wake: Box::new(|| {}) };
+    let start = backend::StartContext { cwd: dir.clone(), bridge: None, computer: false, tools: None, wake: Box::new(|| {}) };
     let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
     app.agent_chat.backend = Some(Box::new(acp_client::AcpBackend::start(&argv, start).unwrap()));
     app.agent_chat.state = Some(State::Starting);
@@ -2795,7 +2806,7 @@ while IFS= read -r line; do
 done
 "#;
     let argv = vec!["sh".to_string(), "-c".to_string(), script.to_string(), "fake-agent".to_string(), log.to_string_lossy().into_owned()];
-    let start = backend::StartContext { cwd: dir.clone(), bridge: None, tools: None, wake: Box::new(|| {}) };
+    let start = backend::StartContext { cwd: dir.clone(), bridge: None, computer: false, tools: None, wake: Box::new(|| {}) };
     let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
     app.agent_chat.backend = Some(Box::new(acp_client::AcpBackend::start(&argv, start).unwrap()));
     app.agent_chat.state = Some(State::Starting);
@@ -3877,6 +3888,56 @@ fn a_long_message_keeps_the_buttons_in_the_window() {
         let above = bottom(&h) - y;
         assert!((above - rest).abs() < 1.0, "{name} moved from {rest} to {above} above the panel's bottom");
     }
+}
+
+/// The chat's text size: the preference within its range, and A− / A+ under the input change it
+/// a step at a time.
+#[test]
+fn the_chat_text_size_follows_the_preference_and_its_buttons() {
+    assert_eq!(panel::text_scale(1.25), 1.25);
+    assert_eq!(panel::text_scale(9.0), 2.0);
+    assert_eq!(panel::text_scale(0.1), 0.7);
+    assert_eq!(panel::text_scale(f32::NAN), 1.0);
+    assert_eq!(panel::text_step(1.0, 1), 1.1);
+    assert_eq!(panel::text_step(1.25, -1), 1.2, "back on whole steps");
+    assert_eq!(panel::text_step(2.0, 1), 2.0);
+    assert_eq!(panel::text_step(0.7, -1), 0.7);
+    let normal = solidcraft_theme::Tokens::get().font_body;
+    let mut h = crate::scenario::Harness::new();
+    h.call("ui.resize", json!({"width": 1600.0, "height": 1000.0}));
+    h.call("ui.agent_chat", json!({"open": true}));
+    h.frames(8);
+    assert_eq!(h.app.preferences.agent_chat_text_scale, 1.0, "the usual size at first");
+    h.app.agent_chat.push(Item::User {
+        text: "Make the plate thicker".into(),
+        image: false,
+        pictures: Vec::new(),
+        files: Vec::new(),
+        context: Context::default(),
+    });
+    h.app.agent_chat.push(Item::Agent { thought: false, text: "## Done\n\nThe plate is **12 mm** now, see `plate.thickness`.".into() });
+    h.frames(2);
+    let click = |h: &mut crate::scenario::Harness, button: &str| {
+        let at = crate::scenario::handle_at(&format!("agent_chat:{button}")).unwrap_or_else(|| panic!("{button} is drawn"));
+        h.step(&json!({"click": [at.x, at.y]})).unwrap();
+        h.frames(2);
+    };
+    for _ in 0..3 {
+        click(&mut h, "text_bigger");
+    }
+    assert!((h.app.preferences.agent_chat_text_scale - 1.3).abs() < 1e-4, "{}", h.app.preferences.agent_chat_text_scale);
+    click(&mut h, "text_smaller");
+    assert!((h.app.preferences.agent_chat_text_scale - 1.2).abs() < 1e-4, "{}", h.app.preferences.agent_chat_text_scale);
+    for _ in 0..12 {
+        click(&mut h, "text_bigger");
+    }
+    assert_eq!(h.app.preferences.agent_chat_text_scale, 2.0, "no bigger than the range");
+    h.app.agent_chat.input = "Please add a fillet on every outside edge.\n".repeat(20);
+    h.frames(4);
+    let [_, y] = h.widget("Send").expect("Send is drawn with big text");
+    assert!(y < 1000.0, "Send is in the window at {y}");
+    assert!(crate::scenario::handle_at("agent_chat:text_smaller").is_some_and(|p| p.y < 1000.0), "A− stays in the window");
+    assert_eq!(solidcraft_theme::Tokens::get().font_body, normal, "the rest of the window keeps the usual sizes");
 }
 
 fn test_png(colour: [u8; 4], width: u32) -> Vec<u8> {

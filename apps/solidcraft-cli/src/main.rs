@@ -1028,6 +1028,12 @@ pub(crate) fn cmd_bench_open(args: &[String]) -> Result<(), String> {
     };
     let parse_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("{}", json!({"step": "parse", "ms": parse_ms, "features": doc.features.len(), "saved_model": saved.is_some()}));
+    // SolidCraft: why a saved model is not taken (the session only logs it).
+    if let Some(s) = &saved {
+        let t = std::time::Instant::now();
+        let why = solidcraft_engine::doc::Model::adopt(&doc, s).err().map(|e| e.to_string());
+        println!("{}", json!({"step": "adopt", "ms": t.elapsed().as_secs_f64() * 1000.0, "error": why}));
+    }
     if args.iter().any(|a| a == "--parse-only") {
         return Ok(());
     }
