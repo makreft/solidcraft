@@ -18,26 +18,60 @@ use solidcraft_sketch::CurveKind;
 
 use super::CommandSpec;
 use crate::params::{bad, bool_, num, str_, string_list, vec2, vec2_list};
+use crate::schema::cam::{
+    CamContourParams, CamDeleteOpParams, CamDeleteOpReply, CamDrillParams, CamDrillReply, CamEngraveParams, CamEngraveReply, CamListParams,
+    CamListReply, CamMillingReply, CamPocketParams, CamPostDefineParams, CamPostDefineReply, CamPostParams, CamPostReply, CamSetupParams,
+    CamSetupReply, CamSimulateParams, CamSimulateReply, CamToolParams, CamToolReply, CamVCarveParams, CamVCarveReply,
+};
+use crate::schema::{TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
+
+const TOOL_CONTRACT: TypedContract<CamToolParams> = TypedContract::new();
+const SETUP_CONTRACT: TypedContract<CamSetupParams> = TypedContract::new();
+const CONTOUR_CONTRACT: TypedContract<CamContourParams> = TypedContract::new();
+const POCKET_CONTRACT: TypedContract<CamPocketParams> = TypedContract::new();
+const ENGRAVE_CONTRACT: TypedContract<CamEngraveParams> = TypedContract::new();
+const VCARVE_CONTRACT: TypedContract<CamVCarveParams> = TypedContract::new();
+const DRILL_CONTRACT: TypedContract<CamDrillParams> = TypedContract::new();
+const DELETE_OP_CONTRACT: TypedContract<CamDeleteOpParams> = TypedContract::new();
+const POST_CONTRACT: TypedContract<CamPostParams> = TypedContract::new();
+const SIMULATE_CONTRACT: TypedContract<CamSimulateParams> = TypedContract::new();
+const POST_DEFINE_CONTRACT: TypedContract<CamPostDefineParams> = TypedContract::new();
+const LIST_CONTRACT: TypedContract<CamListParams> = TypedContract::new();
 
 /// Chord error of sketch profiles turned into an operation's polygons (mm).
 const PROFILE_TOLERANCE: f64 = 0.005;
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec::new("cam.tool", "CAM Tool", tool_cmd).at("MANUFACTURE", "SETUP").icon("tool").params(
-        "number (1…9999); kind?: flat_endmill|ball_endmill|drill|vbit|tapered_ball (default flat_endmill); diameter (mm, the widest \
+    CommandSpec::new("cam.tool", "CAM Tool", crate::checked!("cam.tool", tool_cmd))
+        .at("MANUFACTURE", "SETUP")
+        .icon("tool")
+        .contract(&TOOL_CONTRACT)
+        .output(output_schema_for::<CamToolReply>)
+        .params(
+            "number (1…9999); kind?: flat_endmill|ball_endmill|drill|vbit|tapered_ball (default flat_endmill); diameter (mm, the widest \
          the cutting edges get); flute_length (mm); tip_angle (vbit: included tip angle, degrees); taper_angle (tapered_ball: per side, \
          degrees); tip_diameter? (vbit: the flat at the tip, default 0 for a sharp point; tapered_ball: its ball, required); description?; \
          flutes?; spindle_rpm?; feed?; plunge_feed?; stepdown?; stepover?; delete?: bool. A tool that narrows to its tip cuts a contour \
          or pocket wall with its top edge on the profile; a pocket floor needs a tip flat",
-    ),
-    CommandSpec::new("cam.setup", "CAM Setup", setup_cmd).at("MANUFACTURE", "SETUP").icon("setup").params(
-        "name; work_offset?: 1…6 (G54…G59; a new setup takes 1); stock?: {min:[x,y,z], max:[x,y,z]} (work coordinates; \
+        ),
+    CommandSpec::new("cam.setup", "CAM Setup", crate::checked!("cam.setup", setup_cmd))
+        .at("MANUFACTURE", "SETUP")
+        .icon("setup")
+        .contract(&SETUP_CONTRACT)
+        .output(output_schema_for::<CamSetupReply>)
+        .params(
+            "name; work_offset?: 1…6 (G54…G59; a new setup takes 1); stock?: {min:[x,y,z], max:[x,y,z]} (work coordinates; \
              the operations' clearance and retract heights must be above its top) | null (none); an update changes only what \
              it is given; delete?: bool",
-    ),
-    CommandSpec::new("cam.contour", "2D Contour", contour_cmd).at("MANUFACTURE", "MILLING").icon("contour").params(
-        "setup; name; tool (number); outer: [[x,y],…] (or regions: [{outer, holes?}], or sketch: id|name with profiles?: \
+        ),
+    CommandSpec::new("cam.contour", "2D Contour", crate::checked!("cam.contour", contour_cmd))
+        .at("MANUFACTURE", "MILLING")
+        .icon("contour")
+        .contract(&CONTOUR_CONTRACT)
+        .output(output_schema_for::<CamMillingReply>)
+        .params(
+            "setup; name; tool (number); outer: [[x,y],…] (or regions: [{outer, holes?}], or sketch: id|name with profiles?: \
          all|[index]|[{point:[x,y]}] (default: every profile that is not the inside of another's hole; copied as polygons \
          within 0.005 mm), rotate?: 0|90|180|270 (deg, about the sketch origin), at?: [x,y] (where the lower left corner \
          of the profiles' bounds goes; default where they are)); holes?: [[[x,y],…]]; side?: outside|inside|on (default \
@@ -52,58 +86,100 @@ pub static COMMANDS: &[CommandSpec] = &[
          cut with a larger tool: this one then cuts only the corners and openings that tool could not reach (no tabs, dogbones or ramps); \
          cut?: {heights, feeds, stepdown} → {setup, operation, bounds, too_small?: openings the tool does not fit, left uncut, \
          rest?: {from, cut_length} | {from, nothing_left: true} (then nothing is saved)}",
-    ),
-    CommandSpec::new("cam.pocket", "2D Pocket", pocket_cmd).at("MANUFACTURE", "MILLING").icon("pocket").params(
-        "setup; name; tool (number); outer: [[x,y],…] (or regions, or sketch with profiles?, rotate?, at? as cam.contour \
+        ),
+    CommandSpec::new("cam.pocket", "2D Pocket", crate::checked!("cam.pocket", pocket_cmd))
+        .at("MANUFACTURE", "MILLING")
+        .icon("pocket")
+        .contract(&POCKET_CONTRACT)
+        .output(output_schema_for::<CamMillingReply>)
+        .params(
+            "setup; name; tool (number); outer: [[x,y],…] (or regions, or sketch with profiles?, rotate?, at? as cam.contour \
          takes them); holes?; stepover? (default the tool's, else half its diameter); climb?; stock_to_leave?; tolerance?; \
          ramp_angle?: deg; dogbones?: bool (notch the pocket's inside corners, so a square part fits); rest_from?: name of an \
          earlier pocket of this setup cleared with a larger tool: this one then cuts only its wall ring's corners and what it did not \
          fit into (no dogbones or ramps); clearance?; retract?; top?; bottom; stepdown?; feed?; plunge_feed?; spindle_rpm?; coolant?; \
          cut? → {setup, operation, bounds, too_small?, rest?: {from, cut_length} | {from, nothing_left: true} (then nothing is saved)}",
-    ),
-    CommandSpec::new("cam.engrave", "Engrave", engrave_cmd).icon("contour").params(
-        "setup; name; tool (number); sketch: id|name with curves?: all | [ids] (default all drawn curves: lines, arcs, circles, splines \
+        ),
+    CommandSpec::new("cam.engrave", "Engrave", crate::checked!("cam.engrave", engrave_cmd))
+        .icon("contour")
+        .contract(&ENGRAVE_CONTRACT)
+        .output(output_schema_for::<CamEngraveReply>)
+        .params(
+            "setup; name; tool (number); sketch: id|name with curves?: all | [ids] (default all drawn curves: lines, arcs, circles, splines \
          and text outlines; not construction, centreline or projected geometry), rotate?, at? (as cam.contour takes them) | paths: \
          [[[x,y],…],…] (a path whose last point is its first is closed); the tool centre follows each curve, open or closed, at every \
          depth pass (an open one back along itself), nothing is offset; top?; retract?; clearance?; bottom; stepdown?; feed?; \
          plunge_feed?; spindle_rpm?; coolant?; tolerance? (ends closer than this are one curve, default 0.01) → {setup, operation, \
          bounds, chains}",
-    ),
-    CommandSpec::new("cam.vcarve", "V-Carve", vcarve_cmd).icon("contour").params(
-        "setup; name; tool (a vbit); outer | regions | sketch with profiles?, rotate?, at? (as cam.contour takes them); the V-bit runs \
+        ),
+    CommandSpec::new("cam.vcarve", "V-Carve", crate::checked!("cam.vcarve", vcarve_cmd))
+        .icon("contour")
+        .contract(&VCARVE_CONTRACT)
+        .output(output_schema_for::<CamVCarveReply>)
+        .params(
+            "setup; name; tool (a vbit); outer | regions | sketch with profiles?, rotate?, at? (as cam.contour takes them); the V-bit runs \
          the inward offsets of the regions, each as deep as its cone touches the wall there: sharp edges at the top, a ridge where the \
          offsets meet; max_depth? (mm below the top; inner passes stay there and the tip clears a flat floor; required when the carving \
          would go deeper than the tool's flutes); stepover? (mm between passes, default 0.1); tolerance?; top?; retract?; clearance?; \
          feed?; plunge_feed?; spindle_rpm?; coolant? → {setup, operation, bounds, depth, rings, flat_clearing?: {wall_offset, bottom} (the \
          floor a flat end mill could clear instead: cam.pocket with stock_to_leave = wall_offset − its radius, bottom)}",
-    ),
-    CommandSpec::new("cam.drill", "Drill", drill_cmd).icon("hole").params(
-        "setup; name; tool (number; any kind, a V-bit with a depth per point makes halftone dots); points: [[x,y],…] | [[x,y,z],…] \
+        ),
+    CommandSpec::new("cam.drill", "Drill", crate::checked!("cam.drill", drill_cmd))
+        .icon("hole")
+        .contract(&DRILL_CONTRACT)
+        .output(output_schema_for::<CamDrillReply>)
+        .params(
+            "setup; name; tool (number; any kind, a V-bit with a depth per point makes halftone dots); points: [[x,y],…] | [[x,y,z],…] \
          (z: that hole's bottom, work Z) | sketch: id|name (its lone points and circle centres, with rotate?, at? as cam.contour takes \
          them); bottom | depth (mm below the top: the holes' bottom unless a point has its own z); top?; retract?; clearance?; peck? \
          (mm per peck, back up to the retract height between pecks); dwell? (seconds at the bottom); plunge_feed? (the feed down; \
          `feed` and `stepdown` are not needed); spindle_rpm?; coolant? → {setup, operation, bounds, holes}",
-    ),
-    CommandSpec::new("cam.delete_op", "Delete CAM Operation", delete_op).at("MANUFACTURE", "MILLING").icon("delete").params("setup; name"),
-    CommandSpec::new("cam.post", "Post Process", post_cmd).at("MANUFACTURE", "POST").icon("post").noundo().params(
-        "setup; post?: rs274 | name of a saved post (default rs274); program?: name (default the setup's); \
+        ),
+    CommandSpec::new("cam.delete_op", "Delete CAM Operation", crate::checked!("cam.delete_op", delete_op))
+        .at("MANUFACTURE", "MILLING")
+        .icon("delete")
+        .contract(&DELETE_OP_CONTRACT)
+        .output(output_schema_for::<CamDeleteOpReply>)
+        .params("setup; name"),
+    CommandSpec::new("cam.post", "Post Process", crate::checked!("cam.post", post_cmd))
+        .at("MANUFACTURE", "POST")
+        .icon("post")
+        .noundo()
+        .contract(&POST_CONTRACT)
+        .output(output_schema_for::<CamPostReply>)
+        .params(
+            "setup; post?: rs274 | name of a saved post (default rs274); program?: name (default the setup's); \
          verify?: bool (default true: read the G-code back and check it against the toolpaths); path?: file to write the \
          program to (then the result has `lines` instead of `gcode`) → {gcode | path, lines, extension, post, operations, \
          readback?}",
-    ),
-    CommandSpec::new("cam.simulate", "Simulate Stock", simulate_cmd).icon("post").noundo().params(
-        "setup; operations?: [names] (default all, in order); resolution?: mm per pixel (default 0.2); stock?: {min:[x,y,z], \
+        ),
+    CommandSpec::new("cam.simulate", "Simulate Stock", crate::checked!("cam.simulate", simulate_cmd))
+        .icon("post")
+        .noundo()
+        .contract(&SIMULATE_CONTRACT)
+        .output(output_schema_for::<CamSimulateReply>)
+        .params(
+            "setup; operations?: [names] (default all, in order); resolution?: mm per pixel (default 0.2); stock?: {min:[x,y,z], \
          max:[x,y,z]} (default the setup's; required when it has none); path: the PNG to write (16-bit grey, the stock top white, the \
          deepest cut black, +Y up) → {path, size: [w, h], resolution, stock, deepest, removed_mm3, operations: [{name, removed_mm3, \
          standing_in_regions_percent? (a pocket or v-carve: how much of its regions still stands above its bottom, what the tool \
          could not reach)}]}",
-    ),
-    CommandSpec::new("cam.post.define", "Define Post", post_define_cmd).icon("post").params(
-        "post: {name, extension, units, decimals, feed_decimals, comments, header, tool_change, tool_change_first, spindle_on, \
+        ),
+    CommandSpec::new("cam.post.define", "Define Post", crate::checked!("cam.post.define", post_define_cmd))
+        .icon("post")
+        .contract(&POST_DEFINE_CONTRACT)
+        .output(output_schema_for::<CamPostDefineReply>)
+        .params(
+            "post: {name, extension, units, decimals, feed_decimals, comments, header, tool_change, tool_change_first, spindle_on, \
          spindle_off, coolant_on, coolant_off, footer, arcs, arc_tolerance, …} (a post as data, saved with the design and \
          replacing one of the same name) | name + delete: true",
-    ),
-    CommandSpec::new("cam.list", "List CAM", list_cmd).icon("list").noundo().params("→ tools, setups (with operations) and saved posts"),
+        ),
+    CommandSpec::new("cam.list", "List CAM", crate::checked!("cam.list", list_cmd))
+        .icon("list")
+        .noundo()
+        .contract(&LIST_CONTRACT)
+        .output(output_schema_for::<CamListReply>)
+        .params("→ tools, setups (with operations) and saved posts"),
 ];
 
 fn tool_cmd(s: &mut Session, p: &Value) -> Result<Value> {
@@ -131,14 +207,7 @@ fn tool_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         }
         return Ok(json!({"deleted": number}));
     }
-    let kind = match str_(p, "kind").unwrap_or("flat_endmill") {
-        "flat_endmill" => ToolKind::FlatEndmill,
-        "ball_endmill" => ToolKind::BallEndmill,
-        "drill" => ToolKind::Drill,
-        "vbit" | "v_bit" => ToolKind::VBit,
-        "tapered_ball" => ToolKind::TaperedBall,
-        other => return Err(bad(cmd, format!("unknown tool kind `{other}` (flat_endmill, ball_endmill, drill, vbit, tapered_ball)"))),
-    };
+    let kind = tool_kind(cmd, str_(p, "kind").unwrap_or("flat_endmill"))?;
     let diameter = num(p, "diameter").ok_or_else(|| bad(cmd, "`diameter` is required (mm)"))?;
     let flute_length = num(p, "flute_length").ok_or_else(|| bad(cmd, "`flute_length` is required (mm)"))?;
     let mut tool = Tool::new(number, kind, diameter, flute_length);
@@ -167,6 +236,18 @@ fn tool_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     }
     doc.cam.tools.sort_by_key(|t| t.number);
     Ok(json!({"tool": tool}))
+}
+
+/// A tool kind by its name.
+pub(crate) fn tool_kind(cmd: &str, kind: &str) -> Result<ToolKind> {
+    match kind {
+        "flat_endmill" => Ok(ToolKind::FlatEndmill),
+        "ball_endmill" => Ok(ToolKind::BallEndmill),
+        "drill" => Ok(ToolKind::Drill),
+        "vbit" | "v_bit" => Ok(ToolKind::VBit),
+        "tapered_ball" => Ok(ToolKind::TaperedBall),
+        other => Err(bad(cmd, format!("unknown tool kind `{other}` (flat_endmill, ball_endmill, drill, vbit, tapered_ball)"))),
+    }
 }
 
 fn setup_cmd(s: &mut Session, p: &Value) -> Result<Value> {
@@ -217,7 +298,8 @@ fn setup_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"setup": setup_json(s.doc.cam.setup(&name).unwrap_or(&setup))}))
 }
 
-fn stock_box(cmd: &str, v: &Value) -> Result<StockBox> {
+/// A stock box `{min, max}` from its JSON, checked.
+pub(crate) fn stock_box(cmd: &str, v: &Value) -> Result<StockBox> {
     let min = v.get("min").and_then(Value::as_array).filter(|a| a.len() == 3);
     let max = v.get("max").and_then(Value::as_array).filter(|a| a.len() == 3);
     let (Some(min), Some(max)) = (min, max) else {
@@ -519,20 +601,7 @@ fn holes_param(s: &Session, cmd: &str, p: &Value, common: Option<f64>) -> Result
         if points.len() > MAX_DRILL_HOLES {
             return Err(bad(cmd, format!("a drilling has at most {MAX_DRILL_HOLES} holes")));
         }
-        points
-            .iter()
-            .map(|q| {
-                let a = q
-                    .as_array()
-                    .filter(|a| a.len() == 2 || a.len() == 3)
-                    .ok_or_else(|| bad(cmd, "`points` must be a list of [x, y] or [x, y, z]"))?;
-                let n = |i: usize| {
-                    a.get(i).and_then(Value::as_f64).filter(|v| v.is_finite()).ok_or_else(|| bad(cmd, "point coordinates must be finite numbers"))
-                };
-                let z = if a.len() == 3 { Some(n(2)?) } else { None };
-                Ok((Vec2::new(n(0)?, n(1)?), z))
-            })
-            .collect::<Result<_>>()?
+        points.iter().map(|q| drill_point(cmd, q)).collect::<Result<_>>()?
     };
     at.into_iter()
         .map(|(q, z)| {
@@ -542,6 +611,14 @@ fn holes_param(s: &Session, cmd: &str, p: &Value, common: Option<f64>) -> Result
             Ok(hole)
         })
         .collect()
+}
+
+/// One of a drilling's `points`: `[x, y]`, or `[x, y, z]` with the hole's own bottom.
+pub(crate) fn drill_point(cmd: &str, q: &Value) -> Result<(Vec2, Option<f64>)> {
+    let a = q.as_array().filter(|a| a.len() == 2 || a.len() == 3).ok_or_else(|| bad(cmd, "`points` must be a list of [x, y] or [x, y, z]"))?;
+    let n = |i: usize| a.get(i).and_then(Value::as_f64).filter(|v| v.is_finite()).ok_or_else(|| bad(cmd, "point coordinates must be finite numbers"));
+    let z = if a.len() == 3 { Some(n(2)?) } else { None };
+    Ok((Vec2::new(n(0)?, n(1)?), z))
 }
 
 /// Where a sketch marks holes: its points that belong to no curve (not the origin, not projected
@@ -598,24 +675,24 @@ fn chains_param(s: &Session, cmd: &str, p: &Value) -> Result<Vec<PolylineChain>>
     if paths.len() > MAX_CHAINS {
         return Err(bad(cmd, format!("an engraving has at most {MAX_CHAINS} curves")));
     }
-    paths
+    paths.iter().map(|path| path_chain(cmd, path)).collect()
+}
+
+/// One of an engraving's `paths`: its points, closed when the last is the first.
+pub(crate) fn path_chain(cmd: &str, path: &Value) -> Result<PolylineChain> {
+    let mut pts = path
+        .as_array()
+        .ok_or_else(|| bad(cmd, "`paths` must be a list of point lists"))?
         .iter()
-        .map(|path| {
-            let mut pts = path
-                .as_array()
-                .ok_or_else(|| bad(cmd, "`paths` must be a list of point lists"))?
-                .iter()
-                .map(|q| vec2(q).map(|q| [q.x, q.y]).ok_or_else(|| bad(cmd, "path points must be [x, y]")))
-                .collect::<Result<Vec<_>>>()?;
-            let closed = pts.len() >= 4 && pts.first().zip(pts.last()).is_some_and(|(a, b)| (a[0] - b[0]).hypot(a[1] - b[1]) <= 1e-9);
-            if closed {
-                pts.pop();
-            }
-            let chain = PolylineChain { points: pts, closed };
-            chain.validate().map_err(|e| bad(cmd, e.to_string()))?;
-            Ok(chain)
-        })
-        .collect()
+        .map(|q| vec2(q).map(|q| [q.x, q.y]).ok_or_else(|| bad(cmd, "path points must be [x, y]")))
+        .collect::<Result<Vec<_>>>()?;
+    let closed = pts.len() >= 4 && pts.first().zip(pts.last()).is_some_and(|(a, b)| (a[0] - b[0]).hypot(a[1] - b[1]) <= 1e-9);
+    if closed {
+        pts.pop();
+    }
+    let chain = PolylineChain { points: pts, closed };
+    chain.validate().map_err(|e| bad(cmd, e.to_string()))?;
+    Ok(chain)
 }
 
 /// The sketch's drawn curves as polylines within `PROFILE_TOLERANCE`: all of them, or the ones
@@ -776,7 +853,7 @@ fn reach_report(tool: &Tool, op: &CamOperation) -> (Value, Vec<Value>) {
 }
 
 /// `tabs`: `true` for the usual ones, or some of them changed; `false` or left out: none.
-fn tabs_param(cmd: &str, p: &Value) -> Result<Option<Tabs>> {
+pub(crate) fn tabs_param(cmd: &str, p: &Value) -> Result<Option<Tabs>> {
     let usual = Tabs { width: 8.0, height: 3.0, spacing: 250.0, inner: true };
     match p.get("tabs") {
         None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(None),
@@ -791,7 +868,7 @@ fn tabs_param(cmd: &str, p: &Value) -> Result<Option<Tabs>> {
     }
 }
 
-fn parse_side(cmd: &str, side: &str) -> Result<Side> {
+pub(crate) fn parse_side(cmd: &str, side: &str) -> Result<Side> {
     match side {
         "outside" => Ok(Side::Outside),
         "inside" => Ok(Side::Inside),
@@ -813,23 +890,29 @@ fn regions_param(s: &Session, cmd: &str, p: &Value) -> Result<Vec<PolygonRegion>
     }
     let holes = match p.get("holes") {
         None => Vec::new(),
-        Some(Value::Array(hs)) => hs
-            .iter()
-            .map(|h| {
-                let pts = h.as_array().ok_or_else(|| bad(cmd, "`holes` must be a list of point lists"))?;
-                if pts.len() < 3 || pts.len() > solidcraft_doc::cam::MAX_LOOP_POINTS {
-                    return Err(bad(cmd, "each hole needs 3 to 10000 points"));
-                }
-                pts.iter()
-                    .map(|v| crate::params::vec2(v).map(|p| [p.x, p.y]).ok_or_else(|| bad(cmd, "hole points must be [x, y]")))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()?,
-        _ => return Err(bad(cmd, "`holes` must be a list of point lists")),
+        Some(holes) => outline_holes(cmd, holes)?,
     };
     let region = PolygonRegion { outer: outer.into_iter().map(|p| [p.x, p.y]).collect(), holes };
     region.validate().map_err(|e| bad(cmd, e.to_string()))?;
     Ok(vec![region])
+}
+
+/// The `holes` given beside `outer`: a list of point lists, each of 3 to 10000 points.
+pub(crate) fn outline_holes(cmd: &str, holes: &Value) -> Result<Vec<Vec<[f64; 2]>>> {
+    let Value::Array(hs) = holes else {
+        return Err(bad(cmd, "`holes` must be a list of point lists"));
+    };
+    hs.iter()
+        .map(|h| {
+            let pts = h.as_array().ok_or_else(|| bad(cmd, "`holes` must be a list of point lists"))?;
+            if pts.len() < 3 || pts.len() > solidcraft_doc::cam::MAX_LOOP_POINTS {
+                return Err(bad(cmd, "each hole needs 3 to 10000 points"));
+            }
+            pts.iter()
+                .map(|v| crate::params::vec2(v).map(|p| [p.x, p.y]).ok_or_else(|| bad(cmd, "hole points must be [x, y]")))
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect()
 }
 
 /// An operation's regions from a sketch's profiles: by default every profile that is not the
@@ -899,7 +982,8 @@ fn sketch_regions(s: &Session, cmd: &str, p: &Value) -> Result<Vec<PolygonRegion
         .collect()
 }
 
-fn polygon_region(cmd: &str, v: &Value) -> Result<PolygonRegion> {
+/// One of `regions`: `{outer, holes?}` as point lists, checked.
+pub(crate) fn polygon_region(cmd: &str, v: &Value) -> Result<PolygonRegion> {
     let outer = v
         .get("outer")
         .and_then(Value::as_array)

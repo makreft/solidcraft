@@ -41,6 +41,10 @@ mod face;
 mod features;
 mod features_more;
 mod join_pieces;
+pub(crate) use cam::{
+    drill_point as cam_drill_point, outline_holes as cam_outline_holes, parse_side as cam_side, path_chain as cam_path_chain,
+    polygon_region as cam_polygon_region, stock_box as cam_stock_box, tabs_param as cam_tabs_param, tool_kind as cam_tool_kind,
+};
 pub(crate) use construct::{GeoForm, GeoFormError, REF as GEO_REF_FORMS, SKETCH_PART, geo_form, is_model_axis, plane_axis_point_kind};
 pub(crate) use face::{FaceRefForm, face_ref_form};
 pub(crate) use features::profiles as feature_profiles;
