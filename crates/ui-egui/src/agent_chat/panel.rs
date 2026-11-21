@@ -388,6 +388,13 @@ pub fn tip(app: &SolveApp) -> String {
 /// panel in this window, never label selections belonging to another native viewport.
 /// Called before layout so even a click and a shortcut in the same frame are routed here.
 pub(crate) fn owns_keyboard_input(app: &mut SolveApp, ctx: &egui::Context) -> bool {
+    let owned = keyboard_owner(app, ctx);
+    #[cfg(not(target_arch = "wasm32"))]
+    AutoCopySelection::arm(ctx, owned);
+    owned
+}
+
+fn keyboard_owner(app: &mut SolveApp, ctx: &egui::Context) -> bool {
     let visible =
         shown(app) && app.agent_chat.open && (app.preferences.agent_chat_popped || shared_section(app).is_some_and(|section| !section.collapsed));
     let rect = app.agent_chat.panel_rect.filter(|_| visible);
@@ -403,6 +410,84 @@ pub(crate) fn owns_keyboard_input(app: &mut SolveApp, ctx: &egui::Context) -> bo
         }
     });
     app.agent_chat.keyboard_owned
+}
+
+/// Text selected in the conversation goes to the clipboard as soon as the mouse lets go of it,
+/// so Ctrl+V pastes it without a Ctrl+C first. egui reports a settled label selection only at
+/// the end of the pass, so this hook adds the copy to that pass's output. It acts only while
+/// the chat owns the keyboard (the last press was in the panel) and only on label selections:
+/// selecting composer text to replace it leaves the clipboard alone. Only a selection the mouse
+/// made counts, by a drag or a double or triple click: egui also reports a plain click on a
+/// label as a settled selection of that label, and a click must not overwrite the clipboard.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct AutoCopySelection {
+    /// Set by this pass's `owns_keyboard_input`; a pass that skips it (a dialog owns the keys)
+    /// copies nothing.
+    chat_owns_input: bool,
+    /// Where the primary button went down last.
+    press_origin: Option<egui::Pos2>,
+    /// The pointer has moved further than a click may since that press.
+    dragged: bool,
+    /// This pass let go of a double or triple click.
+    multi_click: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl AutoCopySelection {
+    /// Installs the hook once and tells it whether this pass's selection belongs to the chat.
+    fn arm(ctx: &egui::Context, chat_owns_input: bool) {
+        ctx.plugin_or_default::<Self>().lock().chat_owns_input = chat_owns_input;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl egui::plugin::Plugin for AutoCopySelection {
+    fn debug_name(&self) -> &'static str {
+        "agent_chat_auto_copy"
+    }
+
+    fn on_begin_pass(&mut self, ui: &mut egui::Ui) {
+        self.chat_owns_input = false;
+        let max_click_dist = ui.ctx().options(|o| o.input_options.max_click_dist);
+        ui.input(|i| {
+            let pointer = &i.pointer;
+            if pointer.primary_pressed() {
+                self.press_origin = pointer.press_origin();
+                self.dragged = false;
+            }
+            if let (Some(from), Some(at)) = (self.press_origin, pointer.latest_pos())
+                && from.distance(at) > max_click_dist
+            {
+                self.dragged = true;
+            }
+            if pointer.primary_released() {
+                self.press_origin = None;
+            }
+            self.multi_click =
+                pointer.button_double_clicked(egui::PointerButton::Primary) || pointer.button_triple_clicked(egui::PointerButton::Primary);
+        });
+    }
+
+    fn output_hook(&mut self, ctx: &egui::Context, output: &mut egui::FullOutput) {
+        if !self.chat_owns_input || !(self.dragged || self.multi_click) {
+            return;
+        }
+        if !ctx.plugin_opt::<egui::text_selection::LabelSelectionState>().is_some_and(|s| s.lock().has_selection()) {
+            return;
+        }
+        let commands = &mut output.platform_output.commands;
+        let settled = commands.iter().rev().find_map(|c| match c {
+            egui::OutputCommand::TextSelectionSettled(text) if !text.trim().is_empty() => Some(text.clone()),
+            _ => None,
+        });
+        // An explicit copy in the same pass (Copy message, Ctrl+C) wins.
+        if let Some(text) = settled
+            && !commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(_)))
+        {
+            commands.push(egui::OutputCommand::CopyText(text));
+        }
+    }
 }
 
 /// Draw the Assistant's standalone desktop window.
@@ -1261,6 +1346,16 @@ fn composer(chat: &mut AgentChat, view: &PanelView, ui: &mut egui::Ui, state: St
                                 solidcraft_ui_registry::publish_handle("agent_chat:send", action.rect.center());
                                 send_clicked = action.clicked();
                             }
+                            // Smaller and bigger text in the chat (also Preferences > AI > Panel >
+                            // Text size), left of Send on this row: the row below wraps in a narrow
+                            // panel, and a row of their own would take that height from the
+                            // conversation. Right to left, so the bigger one comes first.
+                            if glyph_button(ui, "text_bigger", tr("ui.agent_chat_text_bigger")).clicked() {
+                                chat.actions.push(PanelAction::SetTextScale(text_step(scale, 1)));
+                            }
+                            if glyph_button(ui, "text_smaller", tr("ui.agent_chat_text_smaller")).clicked() {
+                                chat.actions.push(PanelAction::SetTextScale(text_step(scale, -1)));
+                            }
                         });
                     },
                 );
@@ -1293,13 +1388,6 @@ fn composer(chat: &mut AgentChat, view: &PanelView, ui: &mut egui::Ui, state: St
                             .backing_on_hover_text(tr("ui.agent_chat_pick_context_tip"));
                         solidcraft_ui_registry::publish_handle("agent_chat:pick_context", picker.rect.center());
                         pick_clicked = picker.clicked();
-                        // Smaller and bigger text in the chat (also Preferences > AI > Panel > Text size).
-                        if glyph_button(ui, "text_smaller", tr("ui.agent_chat_text_smaller")).clicked() {
-                            chat.actions.push(PanelAction::SetTextScale(text_step(scale, -1)));
-                        }
-                        if glyph_button(ui, "text_bigger", tr("ui.agent_chat_text_bigger")).clicked() {
-                            chat.actions.push(PanelAction::SetTextScale(text_step(scale, 1)));
-                        }
                         if let Some(turn) = &chat.turn {
                             let n = turn.changes.to_string();
                             let count = match view.turn_limit {

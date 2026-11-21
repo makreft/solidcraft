@@ -5750,6 +5750,59 @@ fn a_thought_starts_folded_and_its_arrow_opens_it() {
     }
 }
 
+/// A chat with three short replies whose rows `rows_in_view` finds, and those rows.
+fn chat_with_rows() -> (crate::scenario::Harness, Vec<(usize, egui::Rect, egui::Rect)>) {
+    let mut h = narrow_chat();
+    for n in 0..3 {
+        h.app.agent_chat.items.push(Item::Agent { thought: false, text: format!("Parts list row {n}") });
+    }
+    h.frames(4);
+    let rows = rows_in_view(&h);
+    assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), [0, 1, 2], "all rows in view");
+    (h, rows)
+}
+
+/// Text selected in the conversation is copied when the mouse lets go of it, without Ctrl+C;
+/// nothing is copied while the button is still held.
+#[test]
+fn letting_go_of_a_selection_in_the_conversation_copies_it() {
+    let (mut h, rows) = chat_with_rows();
+    let press = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+    let start = rows[0].1.left_center() + egui::vec2(1.0, 0.0);
+    let end = rows[1].1.right_center() - egui::vec2(1.0, 0.0);
+    h.frame_with(vec![egui::Event::PointerMoved(start)]);
+    h.frame_with(vec![press(start, true)]);
+    h.frame_with(vec![egui::Event::PointerMoved(rows[1].1.center())]);
+    h.frame_with(vec![egui::Event::PointerMoved(end)]);
+    assert_eq!(copied_text(&h), None, "nothing is copied while the selection is being dragged");
+    h.frame_with(vec![press(end, false)]);
+    let copied = copied_text(&h).expect("letting go copies the selection");
+    assert!(copied.contains("Parts list row 0") && copied.contains("Parts list row 1"), "both rows: {copied:?}");
+    assert!(!copied.contains("row 2"), "only the selection: {copied:?}");
+    h.frames(3);
+    assert_eq!(copied_text(&h), None, "the selection is copied once, not every frame");
+}
+
+/// A plain click in the conversation selects nothing and so copies nothing: the clipboard keeps
+/// what was there.
+#[test]
+fn a_click_in_the_conversation_copies_nothing() {
+    let (mut h, rows) = chat_with_rows();
+    click_at(&mut h, rows[1].1.center(), egui::PointerButton::Primary);
+    assert_eq!(copied_text(&h), None);
+}
+
+/// A double click selects text in the conversation, and letting go of it copies that text.
+#[test]
+fn a_double_click_in_the_conversation_copies_what_it_selects() {
+    let (mut h, rows) = chat_with_rows();
+    click_at(&mut h, rows[1].1.center(), egui::PointerButton::Primary);
+    assert_eq!(copied_text(&h), None, "the first click copies nothing");
+    click_at(&mut h, rows[1].1.center(), egui::PointerButton::Primary);
+    let copied = copied_text(&h).expect("the double click copies its selection");
+    assert!(!copied.trim().is_empty() && "Parts list row 1".contains(copied.as_str()), "a part of the clicked row: {copied:?}");
+}
+
 fn shared_assistant_harness() -> (crate::scenario::Harness, Script) {
     let mut h = narrow_chat();
     h.app.home.open = false;
