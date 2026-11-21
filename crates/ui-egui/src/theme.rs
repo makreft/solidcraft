@@ -11,9 +11,6 @@ use solidcraft_theme::{
     AccentRamp, Custom, Environment, Fade, PublishedTab, Surfaces, TabAccent, Tokens, is_dark, set_custom, set_published, viewport_dark, vision,
 };
 
-// SolidCraft's theme files (`assets/styles/ui/themes`), collected at build time.
-include!(concat!(env!("OUT_DIR"), "/builtin_themes.rs"));
-
 thread_local! {
     /// The usual tokens and the ones [`with_text_scale`] draws with in their place, while one part
     /// of the window is drawn with its own text size, per thread like the theme's state. `None`
@@ -77,13 +74,6 @@ pub fn text_scaled(tokens: Tokens, scale: f32) -> Tokens {
     }
     t
 }
-
-/// Installs SolidCraft's built-in theme files ([`BUILTIN`]) as `theme_files`' built-in themes, once
-/// per process, before preferences are read or the first frame; later calls find them installed.
-pub fn install_builtin_themes() {
-    crate::theme_files::install_builtin(BUILTIN);
-}
-
 #[derive(Clone)]
 struct PreparedTheme {
     file: crate::theme_files::ThemeFile,
